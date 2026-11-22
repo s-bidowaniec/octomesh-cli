@@ -1,0 +1,8 @@
+/target
+.octomesh/state.db*
+adapters/.venv
+adapters/.pytest_cache
+adapters/.ruff_cache
+**/__pycache__/
+*.pyc
+.DS_Store

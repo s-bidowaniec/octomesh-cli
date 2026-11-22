@@ -1,0 +1,45 @@
+# Octomesh Configuration
+max_depth = 2
+default_cooldown_secs = 300
+adapter_runner = ["uv", "run", "--project", "adapters", "python", "-m", "octomesh_adapters.runner"]
+
+[roles]
+coder = ["codex", "claude", "agy", "vibe"]
+reviewer = ["agy", "vibe", "codex", "claude"]
+fast = ["vibe", "agy", "codex", "claude"]
+all = ["claude", "codex", "agy", "vibe"]
+demo = ["mock_primary", "mock_backup"]
+
+[peers.claude]
+adapter = "claude"
+command = "claude"
+timeout_secs = 180
+cooldown_secs = 300
+
+[peers.codex]
+adapter = "codex"
+command = "codex"
+timeout_secs = 180
+cooldown_secs = 180
+
+[peers.vibe]
+adapter = "vibe"
+command = "vibe"
+timeout_secs = 180
+cooldown_secs = 180
+
+[peers.agy]
+adapter = "agy"
+command = "agy"
+timeout_secs = 180
+cooldown_secs = 180
+
+[peers.mock_primary]
+adapter = "mock"
+timeout_secs = 5
+cooldown_secs = 60
+
+[peers.mock_backup]
+adapter = "mock"
+timeout_secs = 5
+cooldown_secs = 60

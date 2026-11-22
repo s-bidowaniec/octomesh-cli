@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "octomesh": {
+      "command": "octo",
+      "args": ["mcp-serve"],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}
