@@ -2,6 +2,7 @@ use crate::config::MeshConfig;
 use crate::db::{Blackboard, DbError, PeerHealth};
 use crate::protocol::{AdapterErrorCode, AdapterRequest, AdapterResponse};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -34,6 +35,24 @@ pub enum MeshError {
 
     #[error("Adapter subprocess error: {0}")]
     Subprocess(String),
+}
+
+/// Maskuje wartości sekretów z `env` (klucze typu *_KEY / *_TOKEN / SECRET / PASSWORD)
+/// w tekście, który może trafić do logów, SQLite (last_error / task_history) lub odpowiedzi
+/// — stderr CLI potrafi echo'ować klucze API.
+fn redact_secrets(text: &str, env: &HashMap<String, String>) -> String {
+    let mut out = text.to_string();
+    for (key, val) in env {
+        let k = key.to_uppercase();
+        let sensitive = k.contains("KEY")
+            || k.contains("TOKEN")
+            || k.contains("SECRET")
+            || k.contains("PASSWORD");
+        if sensitive && val.len() >= 8 {
+            out = out.replace(val.as_str(), "***");
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,10 +240,12 @@ impl MeshRouter {
                     });
                 }
                 Ok(adapter_resp) => {
-                    let err_msg = adapter_resp
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| format!("Adapter returned {:?}", adapter_resp.status));
+                    let err_msg = redact_secrets(
+                        &adapter_resp.error_message.clone().unwrap_or_else(|| {
+                            format!("Adapter returned {:?}", adapter_resp.status)
+                        }),
+                        &adapter_req.env,
+                    );
                     warn!(
                         peer = %peer_name,
                         status = ?adapter_resp.status,
@@ -271,7 +292,7 @@ impl MeshRouter {
                     });
                 }
                 Err(sub_err) => {
-                    let err_msg = sub_err.to_string();
+                    let err_msg = redact_secrets(&sub_err.to_string(), &adapter_req.env);
                     let cd = self.config.cooldown_for_peer(&peer_name);
                     self.board.set_peer_health(
                         &peer_name,
@@ -356,9 +377,44 @@ impl MeshRouter {
                 "Invalid JSON from adapter (exit={:?}, parse_err={}): stdout='{}' stderr='{}'",
                 output.status.code(),
                 e,
-                stdout_str.trim(),
-                stderr_str.trim()
+                redact_secrets(stdout_str.trim(), &req.env),
+                redact_secrets(stderr_str.trim(), &req.env)
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_sensitive_env_values() {
+        let mut env = HashMap::new();
+        env.insert(
+            "MISTRAL_API_KEY".to_string(),
+            "sk-test-1234567890".to_string(),
+        );
+        env.insert(
+            "MATRIX_ACCESS_TOKEN".to_string(),
+            "syt_abcdefgh".to_string(),
+        );
+        env.insert("PLAIN_NOTE".to_string(), "hello-world".to_string());
+        let text = "auth failed for sk-test-1234567890 (token syt_abcdefgh) note=hello-world";
+        let out = redact_secrets(text, &env);
+        assert!(!out.contains("sk-test-1234567890"));
+        assert!(!out.contains("syt_abcdefgh"));
+        assert!(
+            out.contains("hello-world"),
+            "non-sensitive values stay visible"
+        );
+        assert!(out.contains("***"));
+    }
+
+    #[test]
+    fn ignores_short_values() {
+        let mut env = HashMap::new();
+        env.insert("API_KEY".to_string(), "short".to_string());
+        assert_eq!(redact_secrets("key=short", &env), "key=short");
     }
 }
