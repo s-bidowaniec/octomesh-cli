@@ -67,7 +67,8 @@ def build_augmented_prompt(
     ]
     if readonly:
         parts.append(
-            "CONSTRAINT: Operate in STRICT READ-ONLY mode. Do NOT modify, create, or delete any files."
+            "CONSTRAINT: Operate in STRICT READ-ONLY mode. "
+            "Do NOT modify, create, or delete any files."
         )
     parts.append(prompt)
 
