@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 
+mod backup;
+mod workspace;
+use workspace::Workspace;
+
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../octomesh.toml.example");
 const DEFAULT_PROTOCOL_MD: &str = include_str!("../../../templates/PROTOCOL.md");
 
@@ -79,6 +83,27 @@ enum Commands {
 
     /// Run a local Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio
     McpServe,
+
+    /// Manage the project's local shared files and cloud export folder
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// Create the shared files and exports directories
+    Init,
+    /// Print the project root and shared directories as JSON
+    Info,
+    /// Copy a completed file from the shared files directory to exports
+    Publish {
+        /// Relative path within the shared files directory
+        file: PathBuf,
+    },
+    /// Exchange immutable workspace revisions through an encrypted rclone remote
+    Backup(backup::BackupArgs),
 }
 
 fn global_config_dirs() -> Vec<PathBuf> {
@@ -205,7 +230,29 @@ async fn main() -> Result<()> {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
             cmd_mcp_serve(&cfg_path, &db_path).await
         }
+        Commands::Workspace { command } => cmd_workspace(command),
     }
+}
+
+fn active_workspace(cwd: &Path) -> Option<Workspace> {
+    Workspace::discover(cwd).filter(|workspace| workspace.ensure_dirs(false).is_ok())
+}
+
+fn cmd_workspace(command: WorkspaceCommand) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let workspace = Workspace::discover(&cwd)
+        .context("No OctoMesh project found. Run octo init at the project root first")?;
+    match command {
+        WorkspaceCommand::Init | WorkspaceCommand::Info => {
+            workspace.ensure_dirs(matches!(command, WorkspaceCommand::Init))?;
+            println!("{}", serde_json::to_string_pretty(&workspace)?);
+        }
+        WorkspaceCommand::Publish { file } => {
+            println!("{}", workspace.publish(&file)?.display());
+        }
+        WorkspaceCommand::Backup(args) => backup::run(&workspace, args)?,
+    }
+    Ok(())
 }
 
 fn cmd_init(config_path: &Path, sync_agents: bool, force: bool) -> Result<()> {
@@ -349,6 +396,7 @@ async fn cmd_mcp_serve(config_path: &Path, db_path: &Path) -> Result<()> {
     let config = MeshConfig::load_from_path(config_path)?;
     let board = Blackboard::open(db_path)?;
     let cwd = std::env::current_dir()?;
+    let workspace = active_workspace(&cwd);
     let (min_depth, ancestors) = env_router_context();
     let router = MeshRouter::new(config, board, cwd).with_env_context(min_depth, ancestors);
 
@@ -387,7 +435,14 @@ async fn cmd_mcp_serve(config_path: &Path, db_path: &Path) -> Result<()> {
             continue;
         };
 
-        let response = handle_mcp_request(&router, req_id, &req.method, &req.params).await;
+        let response = handle_mcp_request(
+            &router,
+            workspace.as_ref(),
+            req_id,
+            &req.method,
+            &req.params,
+        )
+        .await;
         write_json_line(&mut stdout, &response).await?;
     }
 
@@ -402,7 +457,13 @@ async fn write_json_line(stdout: &mut io::Stdout, payload: &Value) -> Result<()>
     Ok(())
 }
 
-async fn handle_mcp_request(router: &MeshRouter, id: Value, method: &str, params: &Value) -> Value {
+async fn handle_mcp_request(
+    router: &MeshRouter,
+    workspace: Option<&Workspace>,
+    id: Value,
+    method: &str,
+    params: &Value,
+) -> Value {
     match method {
         "initialize" => {
             let negotiated = params
@@ -446,6 +507,15 @@ async fn handle_mcp_request(router: &MeshRouter, id: Value, method: &str, params
             "result": {
                 "tools": [
                     {
+                        "name": "mesh_workspace",
+                        "description": "Locate the current project's local shared files directory.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    },
+                    {
                         "name": "mesh_status",
                         "description": "List available peers (claude, codex, vibe, agy), failover role chains, cooldown states, and recent handoffs from the SQLite blackboard.",
                         "inputSchema": {
@@ -487,7 +557,7 @@ async fn handle_mcp_request(router: &MeshRouter, id: Value, method: &str, params
                 ]
             }
         }),
-        "tools/call" => handle_tool_call(router, id, params).await,
+        "tools/call" => handle_tool_call(router, workspace, id, params).await,
         _ => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -499,7 +569,12 @@ async fn handle_mcp_request(router: &MeshRouter, id: Value, method: &str, params
     }
 }
 
-async fn handle_tool_call(router: &MeshRouter, id: Value, params: &Value) -> Value {
+async fn handle_tool_call(
+    router: &MeshRouter,
+    workspace: Option<&Workspace>,
+    id: Value,
+    params: &Value,
+) -> Value {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params
         .get("arguments")
@@ -507,6 +582,22 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: &Value) -> Val
         .unwrap_or_else(|| json!({}));
 
     match tool_name {
+        "mesh_workspace" => {
+            if let Some(workspace) = workspace {
+                mcp_text_result(
+                    id,
+                    json!({
+                        "project_root": workspace.project_root,
+                        "files": workspace.files,
+                        "inbox": workspace.inbox,
+                    })
+                    .to_string(),
+                    false,
+                )
+            } else {
+                mcp_text_result(id, "Run octo workspace init in this project".into(), true)
+            }
+        }
         "mesh_status" => {
             let peers = router.blackboard().list_peer_states().unwrap_or_default();
             let handoffs = router.blackboard().recent_handoffs(5).unwrap_or_default();
