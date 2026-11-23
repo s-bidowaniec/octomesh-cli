@@ -39,10 +39,10 @@ A hybrid Peer-to-Peer (P2P) & automatic failover mesh bridge for native terminal
                                        v
 +-----------------------------------------------------------------------------+
 |                    Python Adapter Layer (`uv run ...`)                      |
-|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
-|  | mock.py   |  | claude.py |  | vibe.py   |  | codex.py  |  | agy.py    |  |
-|  | (test)    |  | (claude)  |  | (vibe)    |  | (codex)   |  | (agy)     |  |
-|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
+|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
+|  | mock.py   |  | claude.py |  | vibe.py   |  | codex.py  |  | agy.py    |  | dbus.py   |  |
+|  | (test)    |  | (claude)  |  | (vibe)    |  | (codex)   |  | (agy)     |  | (window)  |  |
+|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
 +-----------------------------------------------------------------------------+
 ```
 
@@ -72,7 +72,8 @@ octomesh-cli/
 │       ├── src/
 │       │   └── main.rs
 │       └── tests/
-│           └── failover_integration.rs
+│           ├── failover_integration.rs
+│           └── messaging_integration.rs
 ├── adapters/
 │   ├── pyproject.toml
 │   ├── octomesh_adapters/
@@ -83,7 +84,9 @@ octomesh-cli/
 │   │   ├── mock.py
 │   │   ├── claude.py
 │   │   ├── vibe.py
-│   │   └── codex.py
+│   │   ├── codex.py
+│   │   ├── agy.py
+│   │   └── dbus.py
 │   └── tests/
 │       └── test_adapters.py
 ├── templates/
@@ -177,6 +180,60 @@ cooldown_secs = 60
 adapter = "mock"
 timeout_secs = 5
 cooldown_secs = 60
+```
+
+---
+
+---
+
+## Terminal-to-terminal messaging (D-Bus windows + mailbox)
+
+`octo` replaces ad-hoc scripts and email between terminals with two
+token-effective channels over the shared blackboard (`.octomesh/state.db`, WAL —
+safe to use from multiple open terminals at once):
+
+1. **Async mailbox (structured, local):** `octo send <peer|role|*> "message"`
+   and `octo inbox [--all] [--mark-read]`, or the MCP tools `mesh_send` /
+   `mesh_inbox` from any agent. Messages are short structured rows in the
+   `messages` table (sender, recipient, body, optional `ref_task`, read state) —
+   nothing is re-parsed from mail, a `*` target broadcasts to everyone; a role target is expanded
+   to each member peer at send time.
+2. **Live window push (D-Bus):** peers with `adapter = "dbus"` type the message
+   into the *already open* terminal window over the session bus (KDE Konsole
+   `org.kde.konsole.Session.sendText`, or any custom helper exposing a
+   sendText-style method — configure `bus=`, `path=`, `method=` in the peer's
+   `args`). Use `mesh_ask` / `octo ask` on such a peer for synchronous
+   request/response: with `reply_file=` set, the target agent writes its answer
+   to that file and ends it with a `<<OCTO_DONE>>` line. Without `reply_file`
+   the call returns immediately after typing — ideal for one-line
+   notifications ("unread message from X — run `octo inbox`"), so full message
+   bodies never cross the terminal window and no context is re-sent.
+
+```toml
+[roles]
+windows = ["agy_window", "vibe_window"]
+
+[peers.agy_window]
+adapter = "dbus"
+command = "gdbus"   # or "busctl"
+args = [
+  "bus=org.kde.konsole",
+  "path=/Sessions/2",
+  "method=org.kde.konsole.Session.sendText",
+  "reply_file=.octomesh/inbox/agy_window.md",
+]
+timeout_secs = 120
+cooldown_secs = 60
+```
+
+```bash
+# async mailbox
+./target/release/octo send agy "Review PR #12, focus on auth" --author vibe
+./target/release/octo send reviewer "second opinion needed" --author vibe   # -> each role member
+./target/release/octo inbox --peer agy --mark-read
+
+# synchronous ask into the live agy window (typed via D-Bus, reply via inbox file)
+./target/release/octo ask agy_window "Review the auth middleware" --caller vibe --readonly
 ```
 
 ---

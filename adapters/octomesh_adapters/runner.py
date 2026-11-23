@@ -8,6 +8,7 @@ from .agy import AgyAdapter
 from .base import AdapterRequest, AdapterResponse, BaseAdapter, ErrorCode
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .dbus import DbusWindowAdapter
 from .mock import MockAdapter
 from .vibe import VibeAdapter
 
@@ -17,6 +18,7 @@ ADAPTER_REGISTRY: dict[str, type[BaseAdapter]] = {
     "vibe": VibeAdapter,
     "codex": CodexAdapter,
     "agy": AgyAdapter,
+    "dbus": DbusWindowAdapter,
 }
 
 

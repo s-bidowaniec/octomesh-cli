@@ -76,6 +76,17 @@ pub struct HandoffRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRow {
+    pub id: i64,
+    pub sender: String,
+    pub recipient: String,
+    pub body: String,
+    pub ref_task: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub read_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone)]
 pub struct Blackboard {
     conn: Arc<Mutex<Connection>>,
@@ -140,6 +151,19 @@ impl Blackboard {
                 next_steps TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                body TEXT NOT NULL,
+                ref_task TEXT,
+                created_at TEXT NOT NULL,
+                read_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_recipient
+                ON messages (recipient, read_at);
             ",
         )?;
         Ok(())
@@ -372,5 +396,99 @@ impl Blackboard {
             out.push(item?);
         }
         Ok(out)
+    }
+
+    pub fn send_message(
+        &self,
+        sender: &str,
+        recipient: &str,
+        body: &str,
+        ref_task: Option<&str>,
+    ) -> Result<MessageRow, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO messages (sender, recipient, body, ref_task, created_at, read_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![sender, recipient, body, ref_task, now.to_rfc3339()],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(MessageRow {
+            id,
+            sender: sender.to_string(),
+            recipient: recipient.to_string(),
+            body: body.to_string(),
+            ref_task: ref_task.map(|s| s.to_string()),
+            created_at: now,
+            read_at: None,
+        })
+    }
+
+    /// Messages addressed to `for_peer` (plus broadcasts to 'all'), newest first.
+    pub fn list_messages(
+        &self,
+        for_peer: &str,
+        unread_only: bool,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let sql = if unread_only {
+            "SELECT id, sender, recipient, body, ref_task, created_at, read_at
+             FROM messages
+             WHERE (recipient = ?1 OR recipient = 'all') AND read_at IS NULL
+             ORDER BY id DESC LIMIT ?2"
+        } else {
+            "SELECT id, sender, recipient, body, ref_task, created_at, read_at
+             FROM messages
+             WHERE (recipient = ?1 OR recipient = 'all')
+             ORDER BY id DESC LIMIT ?2"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![for_peer, limit as i64], |r| {
+            let created_str: String = r.get(5)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let read_str: Option<String> = r.get(6)?;
+            let read_at = read_str
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&Utc));
+            Ok(MessageRow {
+                id: r.get(0)?,
+                sender: r.get(1)?,
+                recipient: r.get(2)?,
+                body: r.get(3)?,
+                ref_task: r.get(4)?,
+                created_at,
+                read_at,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_messages_read(&self, for_peer: &str) -> Result<usize, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let now = Utc::now().to_rfc3339();
+        let affected = conn.execute(
+            "UPDATE messages SET read_at = ?2
+             WHERE (recipient = ?1 OR recipient = 'all') AND read_at IS NULL",
+            params![for_peer, now],
+        )?;
+        Ok(affected)
+    }
+
+    pub fn unread_count(&self, for_peer: &str) -> Result<i64, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE (recipient = ?1 OR recipient = 'all') AND read_at IS NULL",
+            params![for_peer],
+            |r| r.get(0),
+        )?;
+        Ok(count)
     }
 }

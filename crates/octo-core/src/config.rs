@@ -94,6 +94,21 @@ impl MeshConfig {
                 "at least one peer must be defined under [peers]".to_string(),
             ));
         }
+        for name in self.peers.keys().chain(self.roles.keys()) {
+            if !is_valid_mesh_name(name) {
+                return Err(ConfigError::Validation(format!(
+                    "invalid name '{name}': must be non-empty ASCII without whitespace, \
+                     commas, or '*' (reserved for broadcast)"
+                )));
+            }
+        }
+        for role in self.roles.keys() {
+            if self.peers.contains_key(role) {
+                return Err(ConfigError::Validation(format!(
+                    "name '{role}' is used both as a role and as a peer"
+                )));
+            }
+        }
         for (role, chain) in &self.roles {
             if chain.is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -129,5 +144,68 @@ impl MeshConfig {
             .get(peer_name)
             .and_then(|p| p.cooldown_secs)
             .unwrap_or(self.default_cooldown_secs)
+    }
+}
+
+/// Mesh names (peers, roles) must be plain ASCII without whitespace or commas:
+/// they are joined with ',' into OCTOMESH_CALLER_CHAIN and used as SQLite
+/// message recipients, so spaces/unicode/commas would break routing.
+fn is_valid_mesh_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "*"
+        && name.is_ascii()
+        && !name.chars().any(|c| c.is_whitespace() || c == ',')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(peer_name: &str, role_name: &str) -> MeshConfig {
+        let mut peers = HashMap::new();
+        peers.insert(
+            peer_name.to_string(),
+            PeerConfig {
+                adapter: "mock".to_string(),
+                command: None,
+                args: vec![],
+                timeout_secs: 5,
+                cooldown_secs: None,
+                env: HashMap::new(),
+            },
+        );
+        let mut roles = HashMap::new();
+        roles.insert(role_name.to_string(), vec![peer_name.to_string()]);
+        MeshConfig {
+            max_depth: 2,
+            default_cooldown_secs: 60,
+            adapter_runner: vec!["true".to_string()],
+            roles,
+            peers,
+        }
+    }
+
+    #[test]
+    fn accepts_plain_ascii_names() {
+        assert!(cfg_with("agy_window", "windows").validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_names_with_spaces_unicode_commas_or_star() {
+        for bad in ["my peer", "agy_ö", "a,b", "*", ""] {
+            assert!(
+                cfg_with(bad, "role_x").validate().is_err(),
+                "peer name '{bad}' must be rejected"
+            );
+            assert!(
+                cfg_with("peer_x", bad).validate().is_err(),
+                "role name '{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_role_peer_name_collision() {
+        assert!(cfg_with("same", "same").validate().is_err());
     }
 }

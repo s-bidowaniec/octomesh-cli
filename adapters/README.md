@@ -2,7 +2,8 @@
 
 Python adapter layer for `octomesh-cli` (`octo`). Each adapter wraps one terminal
 AI CLI (Claude, Codex, Mistral Vibe, Antigravity, or the offline `mock`) as a
-headless subprocess.
+headless subprocess, or a live terminal window over D-Bus (`dbus.py` — types the
+message into the open window via `gdbus`/`busctl`; no headless spawn).
 
 Protocol: the runner reads one JSON `AdapterPayload` from stdin and writes one
 JSON `AdapterResponse` to stdout (newline-delimited, no other stdout output).

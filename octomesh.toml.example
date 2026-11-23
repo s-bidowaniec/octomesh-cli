@@ -9,6 +9,8 @@ reviewer = ["agy", "vibe", "codex", "claude"]
 fast = ["vibe", "agy", "codex", "claude"]
 all = ["claude", "codex", "agy", "vibe"]
 demo = ["mock_primary", "mock_backup"]
+# Live terminal windows reached over D-Bus (message typed into the open window)
+windows = ["agy_window", "vibe_window"]
 
 [peers.claude]
 adapter = "claude"
@@ -42,4 +44,33 @@ cooldown_secs = 60
 [peers.mock_backup]
 adapter = "mock"
 timeout_secs = 5
+cooldown_secs = 60
+
+# --- Live terminal windows over the D-Bus session bus (KDE Konsole example) ---
+# The message is typed into the already open window via sendText; the target
+# agent answers in its existing conversation. With reply_file set, `octo ask`
+# waits for the answer written to that file (end it with a <<OCTO_DONE>> line).
+# Without reply_file the call returns immediately after typing (one-line ping).
+[peers.agy_window]
+adapter = "dbus"
+command = "gdbus"
+args = [
+  "bus=org.kde.konsole",
+  "path=/Sessions/2",
+  "method=org.kde.konsole.Session.sendText",
+  "reply_file=.octomesh/inbox/agy_window.md",
+]
+timeout_secs = 120
+cooldown_secs = 60
+
+[peers.vibe_window]
+adapter = "dbus"
+command = "gdbus"
+args = [
+  "bus=org.kde.konsole",
+  "path=/Sessions/1",
+  "method=org.kde.konsole.Session.sendText",
+  "reply_file=.octomesh/inbox/vibe_window.md",
+]
+timeout_secs = 120
 cooldown_secs = 60

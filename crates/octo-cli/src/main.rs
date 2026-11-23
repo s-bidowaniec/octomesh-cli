@@ -77,6 +77,38 @@ enum Commands {
         readonly: bool,
     },
 
+    /// Send an async message to a peer (or role members, or 'all') on the blackboard mailbox
+    Send {
+        /// Recipient: peer name, role (delivered to each member), or '*' (broadcast)
+        target: String,
+
+        /// Message body (keep it short and structured)
+        message: String,
+
+        /// Author identity (defaults to $OCTOMESH_DEFAULT_CALLER or 'human-cli')
+        #[arg(long)]
+        author: Option<String>,
+
+        /// Optional reference to a task_id from `ask` / mesh_ask
+        #[arg(long)]
+        ref_task: Option<String>,
+    },
+
+    /// List mailbox messages addressed to a peer (plus broadcasts to 'all')
+    Inbox {
+        /// Peer identity to read as (defaults to $OCTOMESH_DEFAULT_CALLER or 'human-cli')
+        #[arg(long)]
+        peer: Option<String>,
+
+        /// Include already-read messages
+        #[arg(long)]
+        all: bool,
+
+        /// Mark listed messages as read
+        #[arg(long)]
+        mark_read: bool,
+    },
+
     /// Run a local Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio
     McpServe,
 }
@@ -200,6 +232,23 @@ async fn main() -> Result<()> {
                 },
             )
             .await
+        }
+        Commands::Send {
+            target,
+            message,
+            author,
+            ref_task,
+        } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_send(&cfg_path, &db_path, &target, &message, author, ref_task)
+        }
+        Commands::Inbox {
+            peer,
+            all,
+            mark_read,
+        } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_inbox(&cfg_path, &db_path, peer, all, mark_read)
         }
         Commands::McpServe => {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
@@ -335,6 +384,95 @@ async fn cmd_ask(config_path: &Path, db_path: &Path, req: RouteRequest) -> Resul
     Ok(())
 }
 
+fn default_identity(arg: Option<String>) -> String {
+    arg.or_else(|| std::env::var("OCTOMESH_DEFAULT_CALLER").ok())
+        .unwrap_or_else(|| "human-cli".to_string())
+}
+
+fn expand_recipients(config: &MeshConfig, target: &str) -> Result<Vec<String>> {
+    // '*' is the broadcast target; it is stored internally as recipient 'all'.
+    if target == "*" {
+        return Ok(vec!["all".to_string()]);
+    }
+    config
+        .resolve_candidates(target)
+        .ok_or_else(|| anyhow::anyhow!("Unknown target '{target}' (not a peer, role, or '*')"))
+}
+
+fn cmd_send(
+    config_path: &Path,
+    db_path: &Path,
+    target: &str,
+    message: &str,
+    author: Option<String>,
+    ref_task: Option<String>,
+) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let peer_names: Vec<String> = config.peers.keys().cloned().collect();
+    board.ensure_peers(&peer_names)?;
+    let author = default_identity(author);
+    let recipients = expand_recipients(&config, target)?;
+    let mut ids = Vec::new();
+    for recipient in &recipients {
+        let msg = board.send_message(&author, recipient, message, ref_task.as_deref())?;
+        ids.push(msg.id);
+    }
+    let ids_str = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "[octo] sent message from '{author}' to '{target}' ({} recipient(s), ids: {ids_str})",
+        recipients.len()
+    );
+    Ok(())
+}
+
+fn cmd_inbox(
+    config_path: &Path,
+    db_path: &Path,
+    peer: Option<String>,
+    all: bool,
+    mark_read: bool,
+) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let peer_names: Vec<String> = config.peers.keys().cloned().collect();
+    board.ensure_peers(&peer_names)?;
+    let peer = default_identity(peer);
+    let unread = board.unread_count(&peer)?;
+    if mark_read {
+        let marked = board.mark_messages_read(&peer)?;
+        println!("[octo] marked {marked} message(s) as read for '{peer}'");
+    }
+    let messages = board.list_messages(&peer, !all, 50)?;
+    println!("=== Inbox for '{peer}' (unread: {unread}) ===");
+    if messages.is_empty() {
+        println!("  (empty)");
+    }
+    for m in messages {
+        let ref_part = m
+            .ref_task
+            .as_deref()
+            .map(|t| format!(" [ref_task={t}]"))
+            .unwrap_or_default();
+        let read_part = if m.read_at.is_some() { " (read)" } else { "" };
+        println!(
+            "#{} from={} to={}{}{} at={}\n  {}",
+            m.id,
+            m.sender,
+            m.recipient,
+            ref_part,
+            read_part,
+            m.created_at.to_rfc3339(),
+            m.body
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -461,7 +599,7 @@ async fn handle_mcp_request(router: &MeshRouter, id: Value, method: &str, params
                             "type": "object",
                             "required": ["target", "prompt", "caller"],
                             "properties": {
-                                "target": { "type": "string", "description": "Peer name ('claude', 'codex', 'vibe', 'agy') or role ('coder', 'reviewer', 'fast', 'demo')" },
+                                "target": { "type": "string", "description": "Peer name ('claude', 'codex', 'vibe', 'agy', a D-Bus window peer) or role ('coder', 'reviewer', 'fast', 'demo', 'windows')" },
                                 "prompt": { "type": "string", "description": "Task instructions or review request" },
                                 "caller": { "type": "string", "description": "Your own peer/agent identifier to prevent self-invocation loops" },
                                 "depth": { "type": "integer", "default": 1, "description": "Current delegation hop depth (increment by 1 when forwarding)" },
@@ -481,6 +619,33 @@ async fn handle_mcp_request(router: &MeshRouter, id: Value, method: &str, params
                                 "task_title": { "type": "string", "description": "Short title of the active workstream" },
                                 "summary": { "type": "string", "description": "Completed work and current state" },
                                 "next_steps": { "type": "string", "description": "Concrete remaining actions for the next peer" }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_send",
+                        "description": "Send an async structured message to a peer, role members, or 'all' on the SQLite blackboard mailbox (token-efficient replacement for email between terminals).",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["target", "message"],
+                            "properties": {
+                                "target": { "type": "string", "description": "Peer name, role (delivered to each member), or '*' (broadcast)" },
+                                "message": { "type": "string", "description": "Short structured message body" },
+                                "author": { "type": "string", "description": "Your peer/agent identifier" },
+                                "ref_task": { "type": "string", "description": "Optional task_id from mesh_ask this message refers to" }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_inbox",
+                        "description": "List mailbox messages addressed to you (plus broadcasts to 'all'); optionally mark them read.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "peer": { "type": "string", "description": "Your peer/agent identifier (defaults to $OCTOMESH_DEFAULT_CALLER)" },
+                                "unread_only": { "type": "boolean", "default": true, "description": "Only unread messages" },
+                                "mark_read": { "type": "boolean", "default": false, "description": "Mark listed messages as read" },
+                                "limit": { "type": "integer", "default": 20, "description": "Max messages to return" }
                             }
                         }
                     }
@@ -606,6 +771,93 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: &Value) -> Val
                 }
                 Err(e) => mcp_text_result(id, format!("mesh_handoff failed: {e}"), true),
             }
+        }
+        "mesh_send" => {
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let message = args
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw_author = args
+                .get("author")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            let author = if raw_author.is_empty() || raw_author == "unknown" {
+                std::env::var("OCTOMESH_DEFAULT_CALLER").unwrap_or_else(|_| "unknown".to_string())
+            } else {
+                raw_author.to_string()
+            };
+            let ref_task = args
+                .get("ref_task")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let recipients = match expand_recipients(router.config(), &target) {
+                Ok(r) => r,
+                Err(e) => return mcp_text_result(id, format!("mesh_send failed: {e}"), true),
+            };
+            let mut sent = Vec::new();
+            for recipient in &recipients {
+                match router.blackboard().send_message(
+                    &author,
+                    recipient,
+                    &message,
+                    ref_task.as_deref(),
+                ) {
+                    Ok(m) => sent.push(m),
+                    Err(e) => return mcp_text_result(id, format!("mesh_send failed: {e}"), true),
+                }
+            }
+            let body = serde_json::to_string_pretty(&sent).unwrap_or_default();
+            mcp_text_result(id, body, false)
+        }
+        "mesh_inbox" => {
+            let raw_peer = args
+                .get("peer")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            let peer = if raw_peer.is_empty() || raw_peer == "unknown" {
+                std::env::var("OCTOMESH_DEFAULT_CALLER").unwrap_or_else(|_| "unknown".to_string())
+            } else {
+                raw_peer.to_string()
+            };
+            let unread_only = args
+                .get("unread_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let mark_read = args
+                .get("mark_read")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+            let unread = router.blackboard().unread_count(&peer).unwrap_or(0);
+            if mark_read {
+                if let Err(e) = router.blackboard().mark_messages_read(&peer) {
+                    return mcp_text_result(id, format!("mesh_inbox failed: {e}"), true);
+                }
+            }
+            let messages = router
+                .blackboard()
+                .list_messages(&peer, unread_only, limit)
+                .unwrap_or_default();
+            let payload = json!({
+                "peer": peer,
+                "unread": unread,
+                "messages": messages,
+            });
+            mcp_text_result(
+                id,
+                serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                false,
+            )
         }
         _ => json!({
             "jsonrpc": "2.0",
