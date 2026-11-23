@@ -24,6 +24,7 @@ Wynik zawiera trzy ścieżki.
 | `project_root` | Projekt rozpoznany po najbliższym `octomesh.toml` w bieżącym repozytorium |
 | `files` | Lokalny katalog roboczy `.octomesh/workspace/files` dostępny dla obu terminali |
 | `exports` | Katalog `.octomesh/workspace/exports` przeznaczony do publikacji wyników |
+| `inbox` | Katalog zweryfikowanych wersji pobranych z innych maszyn przez backup |
 
 `octo workspace info` działa również z podkatalogów. Klient MCP
 uruchomiony w projekcie może wywołać `mesh_workspace` i odczytać
@@ -68,7 +69,13 @@ artefakty. Pliki pobrane z chmury można ręcznie umieścić w `files`.
 Dokumentacja dostawcy jest w [Filen Desktop](https://github.com/FilenCloudDienste/filen-desktop)
 i [Filen Sync](https://github.com/FilenCloudDienste/filen-sync).
 
-## Alternatywa przez Internxt
+## Internxt PC ↔ VPS
+
+`octo workspace backup --watch` automatycznie wymienia wersje ścieżek z
+`files` przez zaszyfrowany zdalny katalog rclone. Konfigurację i układ
+projektów opisuje [wymiana przez Internxt](internxt-backup.md).
+
+### Ręczne wysłanie jednego pliku
 
 Jeśli używasz Internxt, ten sam kompletny eksport można wysłać przez
 oficjalne CLI. Po zalogowaniu w aplikacji lub CLI użyj ścieżki zwróconej

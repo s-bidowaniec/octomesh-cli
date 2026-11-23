@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 
+mod backup;
 mod workspace;
 use workspace::Workspace;
 
@@ -101,6 +102,8 @@ enum WorkspaceCommand {
         /// Relative path within the shared files directory
         file: PathBuf,
     },
+    /// Exchange immutable workspace revisions through an encrypted rclone remote
+    Backup(backup::BackupArgs),
 }
 
 fn global_config_dirs() -> Vec<PathBuf> {
@@ -247,6 +250,7 @@ fn cmd_workspace(command: WorkspaceCommand) -> Result<()> {
         WorkspaceCommand::Publish { file } => {
             println!("{}", workspace.publish(&file)?.display());
         }
+        WorkspaceCommand::Backup(args) => backup::run(&workspace, args)?,
     }
     Ok(())
 }
@@ -585,6 +589,7 @@ async fn handle_tool_call(
                     json!({
                         "project_root": workspace.project_root,
                         "files": workspace.files,
+                        "inbox": workspace.inbox,
                     })
                     .to_string(),
                     false,

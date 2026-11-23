@@ -143,7 +143,9 @@ Add `octo mcp-serve` to your agent's MCP configuration (see `examples/mcp.json`)
 Run `octo workspace init` in the project. Agents can find its shared files
 through the `mesh_workspace` MCP tool. Use `octo workspace publish RELATIVE_FILE`
 to copy a finished artifact to the export folder for Filen Desktop.
-[Shared workspace and cloud setup](docs/shared-workspace.md)
+For encrypted two-way exchange between machines, use
+`octo workspace backup --watch` with an Internxt-backed rclone crypt remote.
+[Shared workspace](docs/shared-workspace.md) · [Internxt backup](docs/internxt-backup.md)
 
 ## `octomesh.toml` Example
 

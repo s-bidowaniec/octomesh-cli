@@ -10,6 +10,7 @@ pub struct Workspace {
     pub project_root: PathBuf,
     pub files: PathBuf,
     pub exports: PathBuf,
+    pub inbox: PathBuf,
 }
 
 impl Workspace {
@@ -21,6 +22,7 @@ impl Workspace {
                     project_root: project_root.to_path_buf(),
                     files: root.join("files"),
                     exports: root.join("exports"),
+                    inbox: root.join("inbox"),
                 });
             }
             // A nested repository or linked worktree needs its own project.
