@@ -250,7 +250,7 @@ impl MeshRouter {
                         peer = %peer_name,
                         status = ?adapter_resp.status,
                         error = %err_msg,
-                        "Peer failed; evaluating cooldown & failover"
+                        "Peer failed"
                     );
 
                     if adapter_resp.status.triggers_cooldown() {
@@ -317,6 +317,11 @@ impl MeshRouter {
                         detail: err_msg,
                     });
                 }
+            }
+
+            // A window can receive the prompt before the call or reply times out.
+            if peer_cfg.adapter == "dbus" {
+                break;
             }
         }
 

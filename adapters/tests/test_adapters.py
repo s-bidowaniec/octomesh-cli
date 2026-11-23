@@ -186,3 +186,177 @@ def test_codex_adapter_uses_ephemeral_and_readonly_sandbox():
     assert "--skip-git-repo-check" in called_cmd
     assert "-s" in called_cmd
     assert "read-only" in called_cmd
+
+
+def _dbus_payload(tmp_path, command="gdbus", extra_args=None):
+    args = [
+        "bus=org.kde.konsole",
+        "path=/Sessions/2",
+        "method=org.kde.konsole.Session.sendText",
+        "allow_terminal_paste=true",
+    ]
+    if extra_args:
+        args.extend(extra_args)
+    return json.dumps(
+        {
+            "peer": "agy_window",
+            "adapter": "dbus",
+            "prompt": "Review the auth middleware",
+            "caller": "vibe",
+            "depth": 1,
+            "readonly": True,
+            "timeout_secs": 10,
+            "command": command,
+            "args": args,
+            "working_dir": str(tmp_path),
+        }
+    )
+
+
+def test_dbus_adapter_registered():
+    assert "dbus" in ADAPTER_REGISTRY
+
+
+def test_dbus_adapter_requires_bus_path_method(tmp_path):
+    payload = json.dumps(
+        {
+            "peer": "agy_window",
+            "adapter": "dbus",
+            "prompt": "hi",
+            "args": ["bus=org.kde.konsole"],
+            "working_dir": str(tmp_path),
+        }
+    )
+    resp = dispatch(payload)
+    assert resp.status == ErrorCode.EXEC_ERROR
+    assert "bus=" in resp.error_message
+
+
+def test_dbus_adapter_types_into_window_and_reads_reply_file(tmp_path):
+    reply = tmp_path / "inbox" / "reply.md"
+    reply.parent.mkdir()
+    reply.write_text("previous reply", encoding="utf-8")
+    paths = []
+
+    def fake_run(cmd, **kwargs):
+        dispatched_reply = next(
+            directory / reply.name
+            for directory in reply.parent.glob("reply-*")
+            if str(directory / reply.name) in cmd[-1]
+        )
+        paths.append(dispatched_reply)
+        dispatched_reply.write_text(
+            "Answer quoting <<OCTO_DONE>> here\nAnswer from live agy window\n<<OCTO_DONE>>\n",
+            encoding="utf-8",
+        )
+        return CompletedProcess(args=cmd, returncode=0, stdout="(true,)\n", stderr="")
+
+    payload = _dbus_payload(tmp_path, extra_args=["reply_file=inbox/reply.md"])
+    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch(
+        "subprocess.run", side_effect=fake_run
+    ) as mock_run:
+        resp = dispatch(payload)
+        assert dispatch(payload).status == ErrorCode.OK
+
+    assert resp.status == ErrorCode.OK
+    assert "Answer from live agy window" in resp.output
+    assert resp.output.count("<<OCTO_DONE>>") == 1
+    assert paths[0] != paths[1]
+    assert reply.read_text(encoding="utf-8") == "previous reply"
+    called_cmd = mock_run.call_args.args[0]
+    assert called_cmd[:2] == ["gdbus", "call"]
+    assert "--session" in called_cmd
+    assert "org.kde.konsole" in called_cmd
+    assert "/Sessions/2" in called_cmd
+    assert "org.kde.konsole.Session.sendText" in called_cmd
+    typed = called_cmd[-1]
+    assert typed.startswith("'") and typed.endswith("'")
+    assert "Review the auth middleware" in typed
+    assert "readonly=True" in typed
+
+
+def test_dbus_adapter_busctl_form_sends_raw_text(tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return CompletedProcess(args=cmd, returncode=0, stdout="(true,)", stderr="")
+
+    payload = json.loads(_dbus_payload(tmp_path, command="busctl"))
+    payload["prompt"] = "Review the auth middleware\r\n\x1b[201~\x03Keep it staged"
+    with patch("shutil.which", return_value="/usr/bin/busctl"), patch(
+        "subprocess.run", side_effect=fake_run
+    ):
+        resp = dispatch(json.dumps(payload))
+
+    assert resp.status == ErrorCode.OK
+    assert "submit the prompt there" in resp.output
+    cmd = captured["cmd"]
+    assert cmd[:3] == ["busctl", "--user", "call"]
+    assert cmd[3:7] == [
+        "org.kde.konsole",
+        "/Sessions/2",
+        "org.kde.konsole.Session",
+        "sendText",
+    ]
+    assert cmd[7] == "s"
+    assert "Review the auth middleware" in cmd[8]
+    assert all(ord(char) >= 32 for char in cmd[8])
+
+
+def test_dbus_adapter_rejects_konsole_execution_and_unapproved_paste(tmp_path):
+    for overrides in (
+        ["method=org.kde.konsole.Session.runCommand"],
+        ["allow_terminal_paste=false"],
+    ):
+        payload = _dbus_payload(tmp_path, extra_args=overrides)
+        with patch("subprocess.run") as run:
+            resp = dispatch(payload)
+        assert resp.status == ErrorCode.EXEC_ERROR
+        run.assert_not_called()
+
+
+def test_dbus_adapter_rejects_external_reply_path(tmp_path):
+    payload = _dbus_payload(tmp_path, extra_args=["reply_file=../outside.md"])
+    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch("subprocess.run") as run:
+        resp = dispatch(payload)
+    assert resp.status == ErrorCode.EXEC_ERROR
+    assert "relative file path" in resp.error_message
+    run.assert_not_called()
+
+
+def test_dbus_adapter_maps_service_unknown_to_cli_not_found(tmp_path):
+    fake_proc = CompletedProcess(
+        args=["gdbus"],
+        returncode=1,
+        stdout="",
+        stderr="org.freedesktop.DBus.Error.ServiceUnknown: "
+        "The name org.kde.konsole was not provided by any .service files",
+    )
+    payload = _dbus_payload(tmp_path)
+    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch(
+        "subprocess.run", return_value=fake_proc
+    ):
+        resp = dispatch(payload)
+    assert resp.status == ErrorCode.CLI_NOT_FOUND
+
+
+def test_dbus_adapter_missing_caller_binary_is_cli_not_found(tmp_path):
+    payload = _dbus_payload(tmp_path, command="gdbus")
+    with patch("shutil.which", return_value=None):
+        resp = dispatch(payload)
+    assert resp.status == ErrorCode.CLI_NOT_FOUND
+
+
+def test_dbus_adapter_reply_timeout(tmp_path):
+    payload = _dbus_payload(tmp_path, extra_args=["reply_file=inbox/r.md", "poll_secs=0.2"])
+    payload = json.loads(payload)
+    payload["timeout_secs"] = 1
+    payload = json.dumps(payload)
+    fake_proc = CompletedProcess(args=["gdbus"], returncode=0, stdout="(true,)", stderr="")
+    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch(
+        "subprocess.run", return_value=fake_proc
+    ):
+        resp = dispatch(payload)
+    assert resp.status == ErrorCode.TIMEOUT
+    assert "<<OCTO_DONE>>" in resp.error_message

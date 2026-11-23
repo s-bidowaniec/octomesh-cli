@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -76,6 +77,24 @@ pub struct HandoffRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRow {
+    pub id: i64,
+    pub sender: String,
+    pub recipient: String,
+    pub body: String,
+    pub ref_task: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub read_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InboxPage {
+    pub messages: Vec<MessageRow>,
+    pub unread: i64,
+    pub marked_read: usize,
+}
+
 #[derive(Clone)]
 pub struct Blackboard {
     conn: Arc<Mutex<Connection>>,
@@ -108,8 +127,9 @@ impl Blackboard {
     }
 
     fn init_schema(&self) -> Result<(), DbError> {
-        let conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
-        conn.execute_batch(
+        let mut conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS peer_health (
                 peer_name TEXT PRIMARY KEY,
@@ -140,8 +160,38 @@ impl Blackboard {
                 next_steps TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                body TEXT NOT NULL,
+                ref_task TEXT,
+                created_at TEXT NOT NULL,
+                read_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_recipient
+                ON messages (recipient, read_at);
+
+            CREATE TABLE IF NOT EXISTS broadcast_reads (
+                message_id INTEGER NOT NULL,
+                peer TEXT NOT NULL,
+                read_at TEXT NOT NULL,
+                PRIMARY KEY (message_id, peer)
+            );
             ",
         )?;
+        let schema_version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema_version == 0 {
+            // Draft builds stored broadcasts as 'all' and shared one read flag.
+            tx.execute(
+                "UPDATE messages SET recipient = '*', read_at = NULL WHERE recipient = 'all'",
+                [],
+            )?;
+            tx.pragma_update(None, "user_version", 1)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -372,5 +422,119 @@ impl Blackboard {
             out.push(item?);
         }
         Ok(out)
+    }
+
+    pub fn send_messages(
+        &self,
+        sender: &str,
+        recipients: &[String],
+        body: &str,
+        ref_task: Option<&str>,
+    ) -> Result<Vec<i64>, DbError> {
+        let mut conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for recipient in recipients
+            .iter()
+            .filter(|recipient| seen.insert(*recipient))
+        {
+            tx.execute(
+                "INSERT INTO messages (sender, recipient, body, ref_task, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![sender, recipient, body, ref_task, now],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Fetch the newest messages and optionally mark only this page as read.
+    pub fn read_inbox(
+        &self,
+        for_peer: &str,
+        unread_only: bool,
+        limit: usize,
+        mark_read: bool,
+    ) -> Result<InboxPage, DbError> {
+        let mut conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
+        let behavior = if mark_read {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        };
+        let tx = conn.transaction_with_behavior(behavior)?;
+        let mut messages = {
+            let mut stmt = tx.prepare(
+                "WITH inbox AS (
+                    SELECT m.id, m.sender, m.recipient, m.body, m.ref_task, m.created_at,
+                           CASE WHEN m.recipient = '*' THEN b.read_at ELSE m.read_at END AS read_at
+                    FROM messages m
+                    LEFT JOIN broadcast_reads b ON b.message_id = m.id AND b.peer = ?1
+                    WHERE m.recipient IN (?1, '*')
+                )
+                SELECT id, sender, recipient, body, ref_task, created_at, read_at FROM inbox
+                WHERE NOT ?2 OR read_at IS NULL ORDER BY id DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    for_peer,
+                    unread_only,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok(MessageRow {
+                        id: row.get(0)?,
+                        sender: row.get(1)?,
+                        recipient: row.get(2)?,
+                        body: row.get(3)?,
+                        ref_task: row.get(4)?,
+                        created_at: row.get(5)?,
+                        read_at: row.get(6)?,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut marked_read = 0;
+        if mark_read {
+            let now = Utc::now();
+            let timestamp = now.to_rfc3339();
+            for message in messages
+                .iter_mut()
+                .filter(|message| message.read_at.is_none())
+            {
+                if message.recipient == "*" {
+                    tx.execute(
+                        "INSERT INTO broadcast_reads (message_id, peer, read_at) VALUES (?1, ?2, ?3)",
+                        params![message.id, for_peer, timestamp],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE messages SET read_at = ?2 WHERE id = ?1",
+                        params![message.id, timestamp],
+                    )?;
+                }
+                message.read_at = Some(now);
+                marked_read += 1;
+            }
+        }
+        let unread = tx.query_row(
+            "SELECT COUNT(*) FROM messages m
+             WHERE (m.recipient = ?1 AND m.recipient <> '*' AND m.read_at IS NULL)
+                OR (m.recipient = '*' AND NOT EXISTS (
+                    SELECT 1 FROM broadcast_reads b WHERE b.message_id = m.id AND b.peer = ?1
+                ))",
+            params![for_peer],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(InboxPage {
+            messages,
+            unread,
+            marked_read,
+        })
     }
 }

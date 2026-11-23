@@ -43,3 +43,17 @@ cooldown_secs = 60
 adapter = "mock"
 timeout_secs = 5
 cooldown_secs = 60
+
+# Optional Konsole peer. Set the bus destination and session path for your
+# own window. Konsole stages the prompt so you can submit it in that window.
+# [peers.agy_window]
+# adapter = "dbus"
+# command = "gdbus"
+# args = [
+#   "bus=org.kde.konsole",
+#   "path=/Sessions/2",
+#   "method=org.kde.konsole.Session.sendText",
+#   "allow_terminal_paste=true",
+# ]
+# timeout_secs = 120
+# cooldown_secs = 60

@@ -94,6 +94,11 @@ impl MeshConfig {
                 "at least one peer must be defined under [peers]".to_string(),
             ));
         }
+        if self.peers.contains_key("*") || self.roles.contains_key("*") {
+            return Err(ConfigError::Validation(
+                "name '*' is reserved for mailbox broadcasts".to_string(),
+            ));
+        }
         for (role, chain) in &self.roles {
             if chain.is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -129,5 +134,41 @@ impl MeshConfig {
             .get(peer_name)
             .and_then(|p| p.cooldown_secs)
             .unwrap_or(self.default_cooldown_secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(peer_name: &str, role_name: &str) -> MeshConfig {
+        let mut peers = HashMap::new();
+        peers.insert(
+            peer_name.to_string(),
+            PeerConfig {
+                adapter: "mock".to_string(),
+                command: None,
+                args: vec![],
+                timeout_secs: 5,
+                cooldown_secs: None,
+                env: HashMap::new(),
+            },
+        );
+        let mut roles = HashMap::new();
+        roles.insert(role_name.to_string(), vec![peer_name.to_string()]);
+        MeshConfig {
+            max_depth: 2,
+            default_cooldown_secs: 60,
+            adapter_runner: vec!["true".to_string()],
+            roles,
+            peers,
+        }
+    }
+
+    #[test]
+    fn reserves_only_the_broadcast_target() {
+        assert!(cfg_with("*", "reviewer").validate().is_err());
+        assert!(cfg_with("agy", "*").validate().is_err());
+        assert!(cfg_with("all", "reviewer").validate().is_ok());
     }
 }

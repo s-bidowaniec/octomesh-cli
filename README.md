@@ -39,10 +39,10 @@ A hybrid Peer-to-Peer (P2P) & automatic failover mesh bridge for native terminal
                                        v
 +-----------------------------------------------------------------------------+
 |                    Python Adapter Layer (`uv run ...`)                      |
-|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
-|  | mock.py   |  | claude.py |  | vibe.py   |  | codex.py  |  | agy.py    |  |
-|  | (test)    |  | (claude)  |  | (vibe)    |  | (codex)   |  | (agy)     |  |
-|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
+|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
+|  | mock.py   |  | claude.py |  | vibe.py   |  | codex.py  |  | agy.py    |  | dbus.py   |  |
+|  | (test)    |  | (claude)  |  | (vibe)    |  | (codex)   |  | (agy)     |  | (window)  |  |
+|  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+  |
 +-----------------------------------------------------------------------------+
 ```
 
@@ -72,7 +72,8 @@ octomesh-cli/
 │       ├── src/
 │       │   └── main.rs
 │       └── tests/
-│           └── failover_integration.rs
+│           ├── failover_integration.rs
+│           └── messaging_integration.rs
 ├── adapters/
 │   ├── pyproject.toml
 │   ├── octomesh_adapters/
@@ -83,7 +84,9 @@ octomesh-cli/
 │   │   ├── mock.py
 │   │   ├── claude.py
 │   │   ├── vibe.py
-│   │   └── codex.py
+│   │   ├── codex.py
+│   │   ├── agy.py
+│   │   └── dbus.py
 │   └── tests/
 │       └── test_adapters.py
 ├── templates/
@@ -186,6 +189,64 @@ cooldown_secs = 60
 adapter = "mock"
 timeout_secs = 5
 cooldown_secs = 60
+```
+
+---
+
+---
+
+## Terminal-to-terminal messaging (D-Bus windows + mailbox)
+
+`octo` replaces ad-hoc scripts and email between terminals with two
+token-effective channels over the shared blackboard (`.octomesh/state.db`, WAL —
+safe to use from multiple open terminals at once):
+
+1. Send messages with `octo send <peer|role|*>` or `mesh_send`. Role messages
+   go to each member once. A `*` broadcast has independent read status for
+   each peer. Read your inbox with `octo inbox` or `mesh_inbox`. Marking
+   messages read affects only the returned page, and the unread count shows
+   what remains. The mailbox assumes trusted local peers sharing the same
+   project database.
+2. Configure an explicit D-Bus peer for an already open session. KDE Konsole
+   requires `allow_terminal_paste=true`, its security-sensitive D-Bus API
+   enabled, and a session ready to accept a prompt.
+   Its `sendText` method stages a single line for manual submission in the
+   target terminal. A trusted custom D-Bus service can accept a multiline
+   prompt and handle submission itself.
+
+Set `reply_file` to a relative path to wait for the agent's answer with
+`octo ask` or `mesh_ask`. Each dispatch prompts the agent to write to a unique
+file under that path's parent directory and finish with a standalone
+`<<OCTO_DONE>>` line. Completed and late replies stay on disk. Keep the reply
+directory outside version control. Without
+`reply_file`, the call returns after D-Bus acknowledges the transfer. If a
+D-Bus attempt fails or times out, inspect the target session before retrying.
+OctoMesh stops failover at that attempt because the prompt may already have
+arrived.
+
+```toml
+[peers.agy_window]
+adapter = "dbus"
+command = "gdbus"   # or "busctl"
+args = [
+  "bus=org.kde.konsole",
+  "path=/Sessions/2",
+  "method=org.kde.konsole.Session.sendText",
+  "allow_terminal_paste=true",
+]
+timeout_secs = 120
+cooldown_secs = 60
+```
+
+```bash
+# async mailbox
+./target/release/octo send agy "Review PR #12, focus on auth" --author vibe
+./target/release/octo send reviewer "second opinion needed" --author vibe   # -> each role member
+./target/release/octo send '*' "Build ready for review" --author codex
+./target/release/octo inbox --peer agy --mark-read
+
+# stage a prompt for manual submission in the configured Konsole session
+./target/release/octo ask agy_window "Review the auth middleware" --caller vibe --readonly
 ```
 
 ---

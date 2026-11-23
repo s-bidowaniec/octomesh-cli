@@ -51,6 +51,54 @@ impl Drop for TestProject {
 }
 
 #[test]
+fn cli_and_mcp_share_mailbox_and_keep_broadcasts_unread_for_other_peers() {
+    let project = TestProject::new();
+    project.run(
+        &project.0,
+        &["send", "*", "build ready", "--author", "vibe"],
+    );
+    let mut mcp = project
+        .command(&project.0, &["mcp-serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        mcp.stdin.take().unwrap(),
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mesh_inbox",
+                "arguments": { "peer": "agy", "mark_read": true, "limit": 1 }
+            }
+        })
+    )
+    .unwrap();
+    let response = mcp.wait_with_output().unwrap();
+    assert!(response.status.success());
+    let frame: Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(frame["result"]["isError"], false);
+    let page: Value =
+        serde_json::from_str(frame["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["messages"][0]["body"], "build ready");
+    assert_eq!(page["unread"], 0);
+    assert_eq!(page["marked_read"], 1);
+
+    let agy = project.run(&project.0, &["inbox", "--peer", "agy"]);
+    assert!(!String::from_utf8(agy.stdout)
+        .unwrap()
+        .contains("build ready"));
+    let codex = project.run(&project.0, &["inbox", "--peer", "codex"]);
+    assert!(String::from_utf8(codex.stdout)
+        .unwrap()
+        .contains("build ready"));
+}
+
+#[test]
 fn workspace_is_shared_by_cli_and_mcp_in_project_subdirectory() {
     let project = TestProject::new();
     let subdir = project.0.join("docs");

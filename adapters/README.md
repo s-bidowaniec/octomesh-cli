@@ -2,7 +2,8 @@
 
 Python adapter layer for `octomesh-cli` (`octo`). Each adapter wraps one terminal
 AI CLI (Claude, Codex, Mistral Vibe, Antigravity, or the offline `mock`) as a
-headless subprocess.
+headless subprocess or delivers a prompt to an existing session over D-Bus
+using `gdbus` or `busctl`. Konsole stages the prompt for manual submission.
 
 Protocol: the runner reads one JSON `AdapterPayload` from stdin and writes one
 JSON `AdapterResponse` to stdout (newline-delimited, no other stdout output).

@@ -1,5 +1,6 @@
 /target
 .octomesh/state.db*
+.octomesh/inbox/
 .octomesh/workspace/
 adapters/.venv
 adapters/.pytest_cache
