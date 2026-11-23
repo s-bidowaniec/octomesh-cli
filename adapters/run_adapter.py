@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Standalone entrypoint for octomesh_adapters that works from any working directory."""
+
 from __future__ import annotations
 
 import sys

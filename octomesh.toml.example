@@ -1,7 +1,21 @@
 # Octomesh Configuration
+# After `octo install`, use an ABSOLUTE adapter_runner, e.g.
+# adapter_runner = ["python3", "/home/you/.local/share/octomesh/adapters/run_adapter.py"]
 max_depth = 2
 default_cooldown_secs = 300
 adapter_runner = ["uv", "run", "--project", "adapters", "python", "-m", "octomesh_adapters.runner"]
+
+# Optional sections (AF-01..AF-06):
+# [mesh]
+# project = "myproj"            # explicit project id (else git origin slug, else "default")
+# presence_ttl_secs = 120       # presence rows older than this are STALE/pruned
+# busy_ttl_secs = 300           # busy peers recover automatically after this
+# [project]
+# name = "myproj"
+# allowed_connectors = ["github", "drive"]   # connector gateway allowlist ("*" = all)
+# [budgets]
+# default_max_prompt_chars = 20000           # context budget; per-peer override:
+#                                            # [peers.x] max_prompt_chars = 5000
 
 [roles]
 coder = ["codex", "claude", "agy", "vibe"]

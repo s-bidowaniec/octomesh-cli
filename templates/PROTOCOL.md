@@ -7,7 +7,13 @@ You are connected to **Octomesh** (`octo`), a local Peer-to-Peer (P2P) & automat
 2. `mesh_ask` — Delegate a subtask, second opinion, or code review to another peer (`claude`, `codex`, `vibe`, `agy`, a configured D-Bus window peer) or role (`coder`, `reviewer`, `fast`, `all`).
 3. `mesh_handoff` — Record a structured checkpoint to `.octomesh/state.db` before ending your turn or hitting context limits.
 4. `mesh_send` — Send an async structured message to a peer, role, or `*` (broadcast) — blackboard mailbox; preferred over email between terminals.
-5. `mesh_inbox` — Read messages addressed to you (pass `mark_read: true` when done).
+5. `mesh_inbox` — Read messages addressed to you, scoped to the current project (pass `mark_read: true` when done; `ack: [ids]` acknowledges; `all_projects: true` opts out of project scoping).
+6. `mesh_tasks` — List tracked tasks (filter `peer`, `status`, `limit`).
+7. `mesh_ack` — When a window prompt arrives with `task=<id>` in its header, call `mesh_ack {task_id}` when you start working on it (`delivered`/`queued` -> `accepted`).
+8. `mesh_next` — Claim the oldest queued task for you atomically (`lease_secs` protects against crashes; expired leases requeue).
+9. `mesh_task_done` / `mesh_task_fail` — Close a claimed task (`task_id`, optional `reason`).
+10. `mesh_connectors` — List allowed connectors for this project (binary/env-key presence, key names only).
+11. `mesh_connector_call` — Call an allowed connector (`connector`, JSON-RPC `request`); denied connectors answer `connector_not_allowed`.
 
 ## Mandatory Rules for Agents
 
@@ -28,6 +34,13 @@ You are connected to **Octomesh** (`octo`), a local Peer-to-Peer (P2P) & automat
 
 5. **Use the Mailbox for Async Messages:**
    - For asynchronous peer communication use `mesh_send` (target: peer, role, or `*` for broadcast) and read with `mesh_inbox`. Keep bodies short and structured; set `ref_task` when the message relates to a `mesh_ask` task.
+   - Prefer sharing **links** (`octo share`) over pasting file contents.
 
-6. **Window Peers (D-Bus):**
+6. **Claim Before Working, Ack Window Tasks:**
+   - When a delegation header contains `task=<id>`, call `mesh_ack`/`octo ack` when you start and `mesh_task_done`/`octo done` when finished. For queued work, claim it with `mesh_next`/`octo next --peer <you>` first so two terminals never pick the same task.
+
+7. **Respect the Context Budget:**
+   - Keep prompts under `max_prompt_chars` (default 20000 chars; `mesh_status` shows your remaining budget). Oversized prompts fail fast with `budget_exceeded`.
+
+8. **Window Peers (D-Bus):**
    - Answer submitted prompts in your current conversation. If the prompt names a reply file, write your final answer there and finish with a line consisting solely of `<<OCTO_DONE>>`.

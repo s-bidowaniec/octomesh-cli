@@ -1,0 +1,50 @@
+# Global connector registry for `octomesh-cli`
+# Install to: ~/.config/octomesh/connectors.toml
+# Priority order: Google Drive and GitHub first, then GitLab, pCloud, Filen; Figma optional.
+# A project allows a subset via `allowed_connectors` in its octomesh.toml [project] section.
+# Only env key NAMES are stored here — secret values stay in your shell environment.
+
+[connectors.drive]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-gdrive"]
+env_keys = ["GOOGLE_DRIVE_CLIENT_ID", "GOOGLE_DRIVE_CLIENT_SECRET", "GOOGLE_DRIVE_REFRESH_TOKEN"]
+purpose = "Upload/share files and artifacts on Google Drive"
+minimal_scopes = "https://www.googleapis.com/auth/drive.file"
+
+[connectors.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env_keys = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+purpose = "Create issues/PRs/files or share repository references on GitHub"
+minimal_scopes = "repo"
+
+[connectors.gitlab]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-gitlab"]
+env_keys = ["GITLAB_PERSONAL_ACCESS_TOKEN"]
+purpose = "Interact with GitLab repositories and merge requests"
+minimal_scopes = "api"
+
+[connectors.pcloud]
+command = "pcloud-mcp"
+args = []
+env_keys = ["PCLOUD_ACCESS_TOKEN"]
+experimental = true
+purpose = "Share files via pCloud (experimental profile; verify the vendor binary first)"
+minimal_scopes = "file:write"
+
+[connectors.filen]
+command = "filen-mcp"
+args = []
+env_keys = ["FILEN_API_KEY"]
+experimental = true
+purpose = "Share files via Filen drive (experimental profile; verify the vendor binary first)"
+minimal_scopes = "drive:write"
+
+[connectors.figma]
+command = "npx"
+args = ["-y", "figma-developer-mcp"]
+env_keys = ["FIGMA_ACCESS_TOKEN"]
+optional = true
+purpose = "Optional design inspection connector"
+minimal_scopes = "file_content:read"

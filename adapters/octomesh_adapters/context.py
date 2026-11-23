@@ -53,6 +53,22 @@ def capture_git_context(working_dir: str, max_chars: int = MAX_DIFF_CHARS) -> st
     return "\n".join(sections)
 
 
+def build_delegation_header(
+    caller: str,
+    depth: int,
+    readonly: bool,
+    task_id: str | None = None,
+) -> str:
+    """Typed header line; includes `task=<id>` when the router set OCTOMESH_TASK_ID."""
+    parts = ["Octomesh Delegation"]
+    if task_id and task_id.strip():
+        parts.append(f"task={task_id.strip()}")
+    parts.append(f"caller={caller}")
+    parts.append(f"depth={depth}")
+    parts.append(f"readonly={readonly}")
+    return "[" + " | ".join(parts) + "]"
+
+
 def build_augmented_prompt(
     prompt: str,
     *,
@@ -61,9 +77,10 @@ def build_augmented_prompt(
     readonly: bool,
     include_diff: bool,
     working_dir: str,
+    task_id: str | None = None,
 ) -> str:
     parts = [
-        f"[Octomesh Delegation | caller={caller} | depth={depth} | readonly={readonly}]",
+        build_delegation_header(caller, depth, readonly, task_id),
     ]
     if readonly:
         parts.append(

@@ -1,5 +1,5 @@
 use crate::config::MeshConfig;
-use crate::db::{Blackboard, DbError, PeerHealth};
+use crate::db::{Blackboard, DbError, PeerHealth, TaskRow};
 use crate::protocol::{AdapterErrorCode, AdapterRequest, AdapterResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,6 +35,15 @@ pub enum MeshError {
 
     #[error("Adapter subprocess error: {0}")]
     Subprocess(String),
+
+    #[error(
+        "budget_exceeded: prompt length {chars} chars exceeds limit {limit} for peer '{peer}'"
+    )]
+    BudgetExceeded {
+        peer: String,
+        chars: usize,
+        limit: usize,
+    },
 }
 
 /// Maskuje wartości sekretów z `env` (klucze typu *_KEY / *_TOKEN / SECRET / PASSWORD)
@@ -87,21 +96,29 @@ pub struct MeshRouter {
     config: MeshConfig,
     board: Blackboard,
     working_dir: PathBuf,
+    project: String,
     min_depth: u32,
     ancestors: Vec<String>,
 }
 
 impl MeshRouter {
     pub fn new(config: MeshConfig, board: Blackboard, working_dir: impl Into<PathBuf>) -> Self {
+        let working_dir = working_dir.into();
+        let project = config.project_id(&working_dir);
         let peer_names: Vec<String> = config.peers.keys().cloned().collect();
         let _ = board.ensure_peers(&peer_names);
         Self {
             config,
             board,
-            working_dir: working_dir.into(),
+            project,
+            working_dir,
             min_depth: 0,
             ancestors: Vec::new(),
         }
+    }
+
+    pub fn project(&self) -> &str {
+        &self.project
     }
 
     pub fn with_env_context(mut self, min_depth: u32, ancestors: Vec<String>) -> Self {
@@ -149,6 +166,26 @@ impl MeshRouter {
         let mut attempts = Vec::new();
         let task_id = Uuid::new_v4().to_string();
 
+        // AF-04: every route creates a tracked task row (queued -> delivered/accepted/done | failed).
+        let now = chrono::Utc::now();
+        let task_row = TaskRow {
+            id: task_id.clone(),
+            kind: "ask".to_string(),
+            from_peer: req.caller.clone(),
+            to_peer: req.target.clone(),
+            to_window: None,
+            project: self.project.clone(),
+            prompt_preview: req.prompt.chars().take(160).collect(),
+            status: "queued".to_string(),
+            detail: None,
+            claimed_by: None,
+            claimed_at: None,
+            lease_secs: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = self.board.create_task(&task_row);
+
         for peer_name in candidates {
             // Also prevent self-delegation or ancestor loop when target was a role
             if (!req.caller.is_empty() && peer_name == req.caller)
@@ -179,11 +216,41 @@ impl MeshRouter {
                 None => continue,
             };
 
+            // AF-05: busy carries a TTL lease, so a crashed octo cannot wedge the peer.
             self.board
-                .set_peer_health(&peer_name, PeerHealth::Busy, None, None)?;
+                .set_peer_busy(&peer_name, self.config.mesh.busy_ttl_secs, None)?;
+
+            // AF-05: enforce the context budget BEFORE spawning the adapter.
+            let prompt_chars = req.prompt.chars().count();
+            let prompt_limit = self.config.max_prompt_chars_for_peer(&peer_name);
+            if prompt_chars > prompt_limit {
+                let detail = format!(
+                    "budget_exceeded: chars={prompt_chars} > limit={prompt_limit} for peer={peer_name}"
+                );
+                let _ = self
+                    .board
+                    .set_task_status(&task_id, "failed", Some(&detail));
+                // No adapter spawn, no cooldown/busy: fail fast for this route.
+                let _ = self
+                    .board
+                    .set_peer_health(&peer_name, PeerHealth::Ready, None, None);
+                attempts.push(PeerAttempt {
+                    peer: peer_name.clone(),
+                    skipped_cooldown: false,
+                    status: None,
+                    detail: detail.clone(),
+                });
+                return Err(MeshError::BudgetExceeded {
+                    peer: peer_name,
+                    chars: prompt_chars,
+                    limit: prompt_limit,
+                });
+            }
 
             let mut env = peer_cfg.env.clone();
             env.insert("OCTOMESH_DEPTH".to_string(), effective_depth.to_string());
+            // AF-04: the window adapter types `task=<id>` into the delegation header.
+            env.insert("OCTOMESH_TASK_ID".to_string(), task_id.clone());
             let mut chain = self.ancestors.clone();
             if !req.caller.is_empty() && !chain.iter().any(|c| c == &req.caller) {
                 chain.push(req.caller.clone());
@@ -214,6 +281,24 @@ impl MeshRouter {
                 Ok(adapter_resp) if adapter_resp.status == AdapterErrorCode::Ok => {
                     self.board
                         .set_peer_health(&peer_name, PeerHealth::Ready, None, None)?;
+                    // AF-05: record context-budget usage (est_tokens = chars / 4).
+                    let _ =
+                        self.board
+                            .record_budget_usage(Some(&task_id), &peer_name, prompt_chars);
+                    // AF-04: window peers are `delivered` (the agent acks via `octo ack`),
+                    // synchronous adapters are `done`.
+                    let (status, detail) = if peer_cfg.adapter == "dbus" {
+                        let window = peer_cfg
+                            .window_bus
+                            .clone()
+                            .unwrap_or_else(|| "dbus".to_string());
+                        ("delivered", Some(format!("window={window}")))
+                    } else {
+                        ("done", None)
+                    };
+                    let _ = self
+                        .board
+                        .set_task_status(&task_id, status, detail.as_deref());
                     self.board.record_task(
                         &task_id,
                         &req.caller,
@@ -253,6 +338,9 @@ impl MeshRouter {
                         "Peer failed"
                     );
 
+                    let _ = self
+                        .board
+                        .set_task_status(&task_id, "failed", Some(&err_msg));
                     if adapter_resp.status.triggers_cooldown() {
                         let cd = self.config.cooldown_for_peer(&peer_name);
                         let health = match adapter_resp.status {
@@ -293,6 +381,9 @@ impl MeshRouter {
                 }
                 Err(sub_err) => {
                     let err_msg = redact_secrets(&sub_err.to_string(), &adapter_req.env);
+                    let _ = self
+                        .board
+                        .set_task_status(&task_id, "failed", Some(&err_msg));
                     let cd = self.config.cooldown_for_peer(&peer_name);
                     self.board.set_peer_health(
                         &peer_name,

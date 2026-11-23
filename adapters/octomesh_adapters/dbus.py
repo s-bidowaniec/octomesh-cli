@@ -161,6 +161,7 @@ class DbusWindowAdapter(BaseAdapter):
             readonly=request.readonly,
             include_diff=request.include_diff,
             working_dir=request.working_dir,
+            task_id=request.env.get("OCTOMESH_TASK_ID"),
         )
         if konsole:
             full_prompt = _terminal_line(full_prompt)
