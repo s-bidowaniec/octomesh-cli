@@ -37,3 +37,15 @@ jobs:
       - name: Run Pytest suite
         working-directory: adapters
         run: uv run pytest -v
+
+  e2e-mock:
+    name: End-to-end mesh harness (mock-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build octo binary
+        run: cargo build --workspace
+      - name: Run mock end-to-end mesh harness
+        run: bash scripts/e2e_mesh.sh --mock-only

@@ -9,6 +9,8 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 
 mod backup;
+mod connector;
+mod doctor;
 mod workspace;
 use workspace::Workspace;
 
@@ -47,8 +49,103 @@ enum Commands {
         force: bool,
     },
 
-    /// Display current peer health, cooldown timers, roles, and recent handoffs
+    /// Display current peer health, cooldown timers, roles, presence, and recent handoffs
     Status,
+
+    /// Install octo + adapters under a prefix and print the shell env snippet
+    Install {
+        /// Install prefix (default ~/.local)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+    },
+
+    /// Structured diagnostics: binary, config, blackboard, runner, peers, D-Bus windows
+    Doctor,
+
+    /// List registered peers (presence table); --all includes stale entries
+    Presence {
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// List projects with unread mailbox counts for a peer
+    Projects {
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
+    /// List tracked tasks (queued/delivered/accepted/done/failed/claimed)
+    Tasks {
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Acknowledge a delivered/queued task (receiver side of AF-04)
+    Ack {
+        task_id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Atomically claim the oldest queued task for a peer (AF-05 lease)
+    Next {
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        lease_secs: i64,
+    },
+
+    /// Mark a task done
+    Done { id: String },
+
+    /// Mark a task failed with an optional reason
+    Fail {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Show the context-budget usage for a peer (limit, used, remaining)
+    Budget {
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
+    /// List connectors from the global registry with per-project permission status
+    Connectors {
+        /// Show the last 20 audited connector calls instead
+        #[arg(long)]
+        audit: bool,
+    },
+
+    /// Connector gateway subcommands
+    Connector {
+        #[command(subcommand)]
+        command: ConnectorCommand,
+    },
+
+    /// Share a workspace file link through a connector into the mesh mailbox
+    Share {
+        /// File path relative to the current directory (must stay inside it)
+        file: PathBuf,
+        /// Connector name from the global registry (e.g. drive, github)
+        #[arg(long)]
+        via: String,
+        /// Recipient peer (or '*')
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        message: Option<String>,
+        /// Print the connector payload and mailbox preview without calling anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Clear cooldown and reset peer health back to ready
     Reset {
@@ -96,9 +193,13 @@ enum Commands {
         /// Optional reference to a task_id from `ask` / mesh_ask
         #[arg(long)]
         ref_task: Option<String>,
+
+        /// Project scope override (defaults to the resolved project id)
+        #[arg(long)]
+        project: Option<String>,
     },
 
-    /// List direct messages and broadcasts for a peer
+    /// List direct messages and broadcasts for a peer (project-scoped by default)
     Inbox {
         /// Peer identity to read as (defaults to $OCTOMESH_DEFAULT_CALLER or 'human-cli')
         #[arg(long)]
@@ -111,6 +212,18 @@ enum Commands {
         /// Mark listed messages as read
         #[arg(long)]
         mark_read: bool,
+
+        /// Project scope override (defaults to the resolved project id)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Opt into messages from all projects
+        #[arg(long)]
+        all_projects: bool,
+
+        /// Acknowledge these message ids (sets ack_at on own rows)
+        #[arg(long)]
+        ack: Vec<i64>,
     },
 
     /// Run a local Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio
@@ -120,6 +233,22 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectorCommand {
+    /// Proxy a JSON-RPC call to a connector's stdio MCP server (permission-checked, audited)
+    Call {
+        /// Connector name from the global registry
+        name: String,
+        /// JSON-RPC request as a JSON string
+        request: Option<String>,
+        /// Read the JSON-RPC request from a file instead
+        #[arg(long)]
+        payload_file: Option<PathBuf>,
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 }
 
@@ -206,6 +335,66 @@ fn env_router_context() -> (u32, Vec<String>) {
     (min_depth, ancestors)
 }
 
+/// Resolve the project id for the current directory from the loaded config.
+fn current_project(config: &MeshConfig) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    config.project_id(&cwd)
+}
+
+fn detect_tty() -> Option<String> {
+    if let Ok(tty) = std::env::var("TTY") {
+        let t = tty.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Ok(link) = fs::read_link("/proc/self/fd/0") {
+        let s = link.to_string_lossy().to_string();
+        if !s.is_empty() && !s.starts_with("pipe:") && !s.starts_with("socket:") {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn detect_host() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// AF-03: register the calling peer in the presence table on every client start
+/// (best effort — never fails the actual command).
+fn register_presence_best_effort(config_arg: Option<&Path>, db_arg: Option<&Path>) {
+    let (cfg_path, db_path) = resolve_paths(
+        config_arg.map(|p| p.to_path_buf()),
+        db_arg.map(|p| p.to_path_buf()),
+    );
+    let Ok(config) = MeshConfig::load_from_path(&cfg_path) else {
+        return;
+    };
+    let Ok(board) = Blackboard::open(&db_path) else {
+        return;
+    };
+    let peer = default_identity(None);
+    let now = chrono::Utc::now();
+    let row = octo_core::PresenceRow {
+        peer,
+        pid: std::process::id() as i64,
+        host: detect_host(),
+        tty: detect_tty(),
+        started_at: now,
+        last_seen: now,
+        meta: Some(json!({"cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()}).to_string()),
+    };
+    let _ = board.upsert_presence(&row);
+    let ttl = config.mesh.presence_ttl_secs.max(1) as i64;
+    let cutoff = now - chrono::Duration::seconds(ttl);
+    let _ = board.prune_presence_before(cutoff);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Strictly direct all logs to stderr so stdout remains clean for CLI / MCP JSON-RPC output
@@ -219,6 +408,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // AF-03: every normal client start registers itself in the presence table.
+    if !matches!(cli.command, Commands::Init { .. }) {
+        register_presence_best_effort(cli.config.as_deref(), cli.db.as_deref());
+    }
+
     match cli.command {
         Commands::Init { sync_agents, force } => {
             let cfg_path = cli.config.unwrap_or_else(|| PathBuf::from("octomesh.toml"));
@@ -227,6 +421,96 @@ async fn main() -> Result<()> {
         Commands::Status => {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
             cmd_status(&cfg_path, &db_path)
+        }
+        Commands::Install { prefix } => {
+            let prefix = prefix.unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join(".local")
+            });
+            let exe = std::env::current_exe().ok();
+            let snippet = doctor::install_octomesh(&prefix, exe.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("Installed octo under {}", prefix.display());
+            println!("Add to your shell rc:\n{snippet}");
+            Ok(())
+        }
+        Commands::Doctor => {
+            let (cfg_path, db_path) = resolve_paths(cli.config.clone(), cli.db.clone());
+            cmd_doctor(&cfg_path, &db_path)
+        }
+        Commands::Presence { all } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_presence(&cfg_path, &db_path, all)
+        }
+        Commands::Projects { peer } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_projects(&cfg_path, &db_path, peer)
+        }
+        Commands::Tasks {
+            peer,
+            status,
+            limit,
+        } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_tasks(
+                &cfg_path,
+                &db_path,
+                peer.as_deref(),
+                status.as_deref(),
+                limit,
+            )
+        }
+        Commands::Ack { task_id, note } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_ack(&cfg_path, &db_path, &task_id, note.as_deref())
+        }
+        Commands::Next {
+            peer,
+            project,
+            lease_secs,
+        } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_next(&cfg_path, &db_path, peer, project, lease_secs)
+        }
+        Commands::Done { id } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_task_status(&cfg_path, &db_path, &id, "done", None)
+        }
+        Commands::Fail { id, reason } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_task_status(&cfg_path, &db_path, &id, "failed", reason.as_deref())
+        }
+        Commands::Budget { peer } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_budget(&cfg_path, &db_path, peer)
+        }
+        Commands::Connectors { audit } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_connectors(&cfg_path, &db_path, audit)
+        }
+        Commands::Connector { command } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_connector(&cfg_path, &db_path, command)
+        }
+        Commands::Share {
+            file,
+            via,
+            to,
+            message,
+            dry_run,
+        } => {
+            let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
+            cmd_share(
+                &cfg_path,
+                &db_path,
+                &file,
+                &via,
+                &to,
+                message.as_deref(),
+                dry_run,
+            )
         }
         Commands::Reset { peer } => {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
@@ -263,17 +547,32 @@ async fn main() -> Result<()> {
             message,
             author,
             ref_task,
+            project,
         } => {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
-            cmd_send(&cfg_path, &db_path, &target, &message, author, ref_task)
+            cmd_send(
+                &cfg_path, &db_path, &target, &message, author, ref_task, project,
+            )
         }
         Commands::Inbox {
             peer,
             all,
             mark_read,
+            project,
+            all_projects,
+            ack,
         } => {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
-            cmd_inbox(&cfg_path, &db_path, peer, all, mark_read)
+            cmd_inbox(
+                &cfg_path,
+                &db_path,
+                peer,
+                all,
+                mark_read,
+                project,
+                all_projects,
+                &ack,
+            )
         }
         Commands::McpServe => {
             let (cfg_path, db_path) = resolve_paths(cli.config, cli.db);
@@ -367,16 +666,355 @@ fn cmd_reset(config_path: &Path, db_path: &Path, peer: Option<&str>) -> Result<(
     Ok(())
 }
 
+fn cmd_doctor(config_path: &Path, db_path: &Path) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path).ok();
+    let (checks, all_ok) = doctor::run_doctor_checks(Some(config_path), db_path, config.as_ref());
+    println!("=== Octomesh Doctor ===");
+    for check in &checks {
+        println!("{}", check.format_line());
+    }
+    if !all_ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn cmd_presence(config_path: &Path, db_path: &Path, all: bool) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let ttl = config.mesh.presence_ttl_secs.max(1) as i64;
+    let now = chrono::Utc::now();
+    let rows = board.list_presence()?;
+    println!("=== Presence (ttl={}s) ===", ttl);
+    for row in rows {
+        let age = now.signed_duration_since(row.last_seen).num_seconds();
+        let state = if age <= ttl { "LIVE" } else { "STALE" };
+        if !all && state == "STALE" {
+            continue;
+        }
+        println!(
+            "  {:<16} {} pid={} host={} tty={} last_seen={}",
+            row.peer,
+            state,
+            row.pid,
+            row.host,
+            row.tty.as_deref().unwrap_or("-"),
+            row.last_seen.to_rfc3339()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_projects(config_path: &Path, db_path: &Path, peer: Option<String>) -> Result<()> {
+    MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let peer = default_identity(peer);
+    let rows = board.list_projects_with_unread(&peer)?;
+    println!("=== Projects with unread for '{peer}' ===");
+    if rows.is_empty() {
+        println!("  (none)");
+    }
+    for row in rows {
+        println!("  {:<40} unread={}", row.project, row.unread);
+    }
+    Ok(())
+}
+
+fn cmd_tasks(
+    config_path: &Path,
+    db_path: &Path,
+    peer: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let rows = board.list_tasks(peer, status, limit)?;
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+fn cmd_ack(config_path: &Path, db_path: &Path, task_id: &str, note: Option<&str>) -> Result<()> {
+    MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let updated = board.ack_task(task_id, note)?;
+    if updated {
+        let task = board
+            .get_task(task_id)?
+            .context("task vanished after ack")?;
+        println!("{}", serde_json::to_string_pretty(&task)?);
+    } else {
+        anyhow::bail!("task '{task_id}' is not in a delivered/queued/claimed state to ack");
+    }
+    Ok(())
+}
+
+fn cmd_next(
+    config_path: &Path,
+    db_path: &Path,
+    peer: Option<String>,
+    project: Option<String>,
+    lease_secs: i64,
+) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let peer = default_identity(peer);
+    let project = project.unwrap_or_else(|| current_project(&config));
+    match board.claim_next_task(&peer, &project, lease_secs)? {
+        Some(task) => println!("{}", serde_json::to_string_pretty(&task)?),
+        None => println!("{{\"claimed\": null, \"peer\": \"{peer}\", \"project\": \"{project}\"}}"),
+    }
+    Ok(())
+}
+
+fn cmd_task_status(
+    config_path: &Path,
+    db_path: &Path,
+    id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let updated = board.set_task_status(id, status, reason)?;
+    if !updated {
+        anyhow::bail!("task '{id}' not found");
+    }
+    let task = board.get_task(id)?.context("task vanished")?;
+    println!("{}", serde_json::to_string_pretty(&task)?);
+    Ok(())
+}
+
+fn cmd_budget(config_path: &Path, db_path: &Path, peer: Option<String>) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let peer = default_identity(peer);
+    let limit = config.max_prompt_chars_for_peer(&peer);
+    let (used_chars, calls) = board.total_used_chars_for_peer(&peer)?;
+    let used_chars = used_chars.max(0) as usize;
+    let remaining = limit.saturating_sub(used_chars);
+    let summary = json!({
+        "peer": peer,
+        "limit_chars": limit,
+        "est_limit_tokens": limit / 4,
+        "used_chars": used_chars,
+        "used_est_tokens": used_chars / 4,
+        "remaining_chars": remaining,
+        "remaining_est_tokens": remaining / 4,
+        "calls_recorded": calls,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn cmd_connectors(config_path: &Path, db_path: &Path, audit: bool) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let project = current_project(&config);
+    if audit {
+        let rows = board.list_connector_calls(20)?;
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    let registry = octo_core::ConnectorsConfig::load_global()?;
+    let rows = connector::status_rows(&registry, &config, &project, &board);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"project": project, "connectors": rows}))?
+    );
+    Ok(())
+}
+
+fn cmd_connector(config_path: &Path, db_path: &Path, command: ConnectorCommand) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let project = current_project(&config);
+    match command {
+        ConnectorCommand::Call {
+            name,
+            request,
+            payload_file,
+            timeout,
+        } => {
+            let request_json = match (request, payload_file) {
+                (Some(r), _) => r,
+                (None, Some(f)) => fs::read_to_string(&f)
+                    .with_context(|| format!("failed to read {}", f.display()))?,
+                (None, None) => anyhow::bail!("provide the JSON-RPC request or --payload-file"),
+            };
+            let registry = octo_core::ConnectorsConfig::load_global()?;
+            let method = serde_json::from_str::<Value>(&request_json)
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            let profile = match connector::check_connector_permission(
+                &registry, &config, &project, &name,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = board.record_connector_call(
+                        &name,
+                        &project,
+                        &method,
+                        false,
+                        Some(&e.message()),
+                    );
+                    println!(
+                        "{}",
+                        json!({"ok": false, "error": {"code": e.code(), "message": e.message()}})
+                    );
+                    std::process::exit(2);
+                }
+            };
+            let timeout_secs = timeout.unwrap_or(connector::DEFAULT_CONNECTOR_TIMEOUT_SECS);
+            match connector::call_connector(profile, &request_json, timeout_secs) {
+                Ok(resp) => {
+                    let ok = serde_json::from_str::<Value>(&resp)
+                        .map(|v| v.get("error").is_none())
+                        .unwrap_or(true);
+                    let _ = board.record_connector_call(&name, &project, &method, ok, None);
+                    println!("{resp}");
+                }
+                Err(e) => {
+                    let _ = board.record_connector_call(&name, &project, &method, false, Some(&e));
+                    println!(
+                        "{}",
+                        json!({"ok": false, "error": {"code": "connector_error", "message": e}})
+                    );
+                    std::process::exit(3);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_share(
+    config_path: &Path,
+    db_path: &Path,
+    file: &Path,
+    via: &str,
+    to: &str,
+    message: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let config = MeshConfig::load_from_path(config_path)?;
+    let board = Blackboard::open(db_path)?;
+    let cwd = std::env::current_dir()?;
+    let project = current_project(&config);
+    let author = default_identity(None);
+
+    // Sandbox: the file must resolve strictly inside the current directory.
+    let rel = file.to_string_lossy().to_string();
+    if file.is_absolute() || rel.split(['/', '\\']).any(|p| p == "..") {
+        anyhow::bail!("path_outside_workspace: file must stay inside the current directory");
+    }
+    let resolved = cwd
+        .join(file)
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.join(file));
+    if !resolved.starts_with(&cwd) || !resolved.is_file() {
+        anyhow::bail!("file_not_found: {}", file.display());
+    }
+    let data = fs::read(&resolved)?;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&data);
+    let sha256 = format!("{:x}", hasher.finalize());
+    let meta = json!({
+        "name": resolved.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        "size_bytes": data.len(),
+        "sha256": sha256,
+    });
+    let tool_name = if via == "github" {
+        "create_file"
+    } else {
+        "upload_file"
+    };
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": {
+            "file_name": meta["name"], "local_path": resolved.display().to_string(),
+            "size_bytes": meta["size_bytes"], "sha256": meta["sha256"],
+        }},
+    });
+    let preview_body = |link: &str| {
+        let prefix = message
+            .map(|m| format!("{}\n", m.trim()))
+            .unwrap_or_default();
+        format!(
+            "{prefix}Shared via {via}: {link}\nfile={} size={}B sha256={}",
+            meta["name"], meta["size_bytes"], meta["sha256"]
+        )
+    };
+
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": true, "project": project, "to": to, "via": via,
+                "connector_payload": payload, "mailbox_preview": preview_body(&format!("<pending:{via}:{}>", meta["name"])),
+            }))?
+        );
+        return Ok(());
+    }
+
+    let registry = octo_core::ConnectorsConfig::load_global()?;
+    let profile = connector::check_connector_permission(&registry, &config, &project, via)
+        .map_err(|e| anyhow::anyhow!("{}: {}", e.code(), e.message()))?;
+    let resp = connector::call_connector(
+        profile,
+        &payload.to_string(),
+        connector::DEFAULT_CONNECTOR_TIMEOUT_SECS,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let link = serde_json::from_str::<Value>(&resp)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/result/content/0/text")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    ["url", "link", "id"]
+                        .iter()
+                        .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(str::to_string))
+                })
+                .or_else(|| Some(resp.clone()))
+        })
+        .unwrap_or(resp);
+    let body = preview_body(&link);
+    let recipients = expand_recipients(&config, to)?;
+    let ids = board.send_messages_project(&author, &recipients, &body, None, &project)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true, "project": project, "to": to, "via": via, "link": link,
+            "message_ids": ids, "file": meta,
+        }))?
+    );
+    Ok(())
+}
+
 fn cmd_status(config_path: &Path, db_path: &Path) -> Result<()> {
     let config = MeshConfig::load_from_path(config_path)?;
     let board = Blackboard::open(db_path)?;
     let peer_names: Vec<String> = config.peers.keys().cloned().collect();
     board.ensure_peers(&peer_names)?;
 
+    let project = current_project(&config);
+    let caller = default_identity(None);
     println!("=== Octomesh Status ===");
     println!("Config: {}", config_path.display());
     println!("State DB: {}", db_path.display());
+    println!("Project: {project}");
     println!("Max Delegation Depth: {}", config.max_depth);
+    println!(
+        "Unread for '{caller}' in '{project}': {}",
+        board.unread_count_project(&caller, &project)?
+    );
+    println!("Open tasks: {}", board.count_open_tasks()?);
     println!("\n[Roles]");
     let mut roles: Vec<_> = config.roles.iter().collect();
     roles.sort_by_key(|(k, _)| *k);
@@ -402,6 +1040,28 @@ fn cmd_status(config_path: &Path, db_path: &Path) -> Result<()> {
             state.health.as_str(),
             cd_display
         );
+    }
+
+    println!("\n[Presence]");
+    let ttl = config.mesh.presence_ttl_secs.max(1) as i64;
+    let now = chrono::Utc::now();
+    let mut any = false;
+    for row in board.list_presence()? {
+        let age = now.signed_duration_since(row.last_seen).num_seconds();
+        if age > ttl {
+            continue;
+        }
+        any = true;
+        println!(
+            "  {:<16} LIVE pid={} host={} tty={}",
+            row.peer,
+            row.pid,
+            row.host,
+            row.tty.as_deref().unwrap_or("-")
+        );
+    }
+    if !any {
+        println!("  (no live peers)");
     }
 
     let handoffs = board.recent_handoffs(5)?;
@@ -452,18 +1112,28 @@ fn cmd_send(
     message: &str,
     author: Option<String>,
     ref_task: Option<String>,
+    project_override: Option<String>,
 ) -> Result<()> {
     let config = MeshConfig::load_from_path(config_path)?;
     let board = Blackboard::open(db_path)?;
     let author = default_identity(author);
+    let project = project_override.unwrap_or_else(|| current_project(&config));
     let recipients = expand_recipients(&config, target)?;
-    let ids = board.send_messages(&author, &recipients, message, ref_task.as_deref())?;
+    let ids = board.send_messages_project(
+        &author,
+        &recipients,
+        message,
+        ref_task.as_deref(),
+        &project,
+    )?;
     let ids_str = ids
         .iter()
         .map(|i| i.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    println!("[octo] sent message from '{author}' to '{target}' (ids: {ids_str})");
+    println!(
+        "[octo] sent message from '{author}' to '{target}' in project '{project}' (ids: {ids_str})"
+    );
     Ok(())
 }
 
@@ -473,16 +1143,32 @@ fn cmd_inbox(
     peer: Option<String>,
     all: bool,
     mark_read: bool,
+    project_override: Option<String>,
+    all_projects: bool,
+    ack: &[i64],
 ) -> Result<()> {
-    MeshConfig::load_from_path(config_path)?;
+    let config = MeshConfig::load_from_path(config_path)?;
     let board = Blackboard::open(db_path)?;
     let peer = default_identity(peer);
-    let page = board.read_inbox(&peer, !all, 50, mark_read)?;
+    let project = project_override.unwrap_or_else(|| current_project(&config));
+    if !ack.is_empty() {
+        let acked = board.ack_messages(&peer, ack)?;
+        println!("[octo] acked {acked} message(s) for '{peer}'");
+    }
+    let page = board.read_inbox_project(&peer, &project, all_projects, !all, 50, mark_read)?;
     if mark_read {
         let marked = page.marked_read;
         println!("[octo] marked {marked} message(s) as read for '{peer}'");
     }
-    println!("=== Inbox for '{peer}' (unread: {}) ===", page.unread);
+    let scope = if all_projects {
+        "all projects".to_string()
+    } else {
+        format!("project '{project}'")
+    };
+    println!(
+        "=== Inbox for '{peer}' ({scope}, unread: {}) ===",
+        page.unread
+    );
     if page.messages.is_empty() {
         println!("  (empty)");
     }
@@ -493,13 +1179,16 @@ fn cmd_inbox(
             .map(|t| format!(" [ref_task={t}]"))
             .unwrap_or_default();
         let read_part = if m.read_at.is_some() { " (read)" } else { "" };
+        let ack_part = if m.ack_at.is_some() { " (ack)" } else { "" };
         println!(
-            "#{} from={} to={}{}{} at={}\n  {}",
+            "#{} from={} to={} project={}{}{}{} at={}\n  {}",
             m.id,
             m.sender,
             m.recipient,
+            m.project,
             ref_part,
             read_part,
+            ack_part,
             m.created_at.to_rfc3339(),
             m.body
         );
@@ -695,14 +1384,95 @@ async fn handle_mcp_request(
                     },
                     {
                         "name": "mesh_inbox",
-                        "description": "List your direct messages and broadcasts. Optionally mark this page as read for your peer.",
+                        "description": "List your direct messages and broadcasts (scoped to the current project). Optionally mark this page as read and/or acknowledge message ids.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "peer": { "type": "string", "description": "Your peer/agent identifier (defaults to $OCTOMESH_DEFAULT_CALLER or human-cli)" },
                                 "unread_only": { "type": "boolean", "default": true, "description": "Only unread messages" },
                                 "mark_read": { "type": "boolean", "default": false, "description": "Mark listed messages as read" },
+                                "ack": { "type": "array", "items": { "type": "integer" }, "description": "Message ids to acknowledge (sets ack_at)" },
+                                "all_projects": { "type": "boolean", "default": false, "description": "Include messages from all projects" },
                                 "limit": { "type": "integer", "minimum": 0, "maximum": 100, "default": 20, "description": "Max messages to return" }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_tasks",
+                        "description": "List tracked tasks (queued/delivered/accepted/claimed/done/failed), optionally filtered by peer and status.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "peer": { "type": "string", "description": "Filter to tasks from/to this peer" },
+                                "status": { "type": "string", "description": "Filter by status (queued, delivered, accepted, claimed, done, failed)" },
+                                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_ack",
+                        "description": "Acknowledge a delivered/queued task: status becomes accepted (receiver side of a window delegation).",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["task_id"],
+                            "properties": {
+                                "task_id": { "type": "string" },
+                                "note": { "type": "string" }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_next",
+                        "description": "Atomically claim the oldest queued task for a peer in the current project (lease-based; stale claims requeue).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "peer": { "type": "string", "description": "Claiming peer (defaults to $OCTOMESH_DEFAULT_CALLER)" },
+                                "project": { "type": "string", "description": "Project scope (defaults to the resolved project id)" },
+                                "lease_secs": { "type": "integer", "default": 300 }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_task_done",
+                        "description": "Mark a task done.",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["task_id"],
+                            "properties": { "task_id": { "type": "string" } }
+                        }
+                    },
+                    {
+                        "name": "mesh_task_fail",
+                        "description": "Mark a task failed with an optional reason.",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["task_id"],
+                            "properties": {
+                                "task_id": { "type": "string" },
+                                "reason": { "type": "string" }
+                            }
+                        }
+                    },
+                    {
+                        "name": "mesh_connectors",
+                        "description": "List connectors from the global registry with per-project permission, binary and env-key presence (names only, never values).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    },
+                    {
+                        "name": "mesh_connector_call",
+                        "description": "Proxy a JSON-RPC request to an allowed connector's stdio MCP server; every call is audited.",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["connector", "request"],
+                            "properties": {
+                                "connector": { "type": "string" },
+                                "request": { "type": "object", "description": "JSON-RPC 2.0 request object" },
+                                "timeout_secs": { "type": "integer", "default": 30 }
                             }
                         }
                     }
@@ -751,12 +1521,31 @@ async fn handle_tool_call(
             }
         }
         "mesh_status" => {
-            let peers = router.blackboard().list_peer_states().unwrap_or_default();
-            let handoffs = router.blackboard().recent_handoffs(5).unwrap_or_default();
+            let board = router.blackboard();
+            let peers = board.list_peer_states().unwrap_or_default();
+            let handoffs = board.recent_handoffs(5).unwrap_or_default();
+            let presence = board.list_presence().unwrap_or_default();
+            let open_tasks = board.count_open_tasks().unwrap_or(0);
+            let caller = default_identity(None);
+            let project = router.project().to_string();
+            let projects = board.list_projects_with_unread(&caller).unwrap_or_default();
+            let (used_chars, calls) = board.total_used_chars_for_peer(&caller).unwrap_or((0, 0));
+            let limit = router.config().max_prompt_chars_for_peer(&caller);
             let payload = json!({
                 "max_depth": router.config().max_depth,
+                "project": project,
                 "roles": router.config().roles,
                 "peers": peers,
+                "presence": presence,
+                "open_tasks": open_tasks,
+                "projects": projects,
+                "budget": {
+                    "peer": caller,
+                    "limit_chars": limit,
+                    "used_chars": used_chars,
+                    "remaining_chars": (limit as i64 - used_chars).max(0),
+                    "calls_recorded": calls,
+                },
                 "recent_handoffs": handoffs,
             });
             mcp_text_result(
@@ -878,13 +1667,19 @@ async fn handle_tool_call(
                 Ok(r) => r,
                 Err(e) => return mcp_text_result(id, format!("mesh_send failed: {e}"), true),
             };
-            match router.blackboard().send_messages(
+            let project = router.project().to_string();
+            match router.blackboard().send_messages_project(
                 &author,
                 &recipients,
                 &message,
                 ref_task.as_deref(),
+                &project,
             ) {
-                Ok(ids) => mcp_text_result(id, json!({ "ids": ids }).to_string(), false),
+                Ok(ids) => mcp_text_result(
+                    id,
+                    json!({ "ids": ids, "project": project }).to_string(),
+                    false,
+                ),
                 Err(e) => mcp_text_result(id, format!("mesh_send failed: {e}"), true),
             }
         }
@@ -910,15 +1705,37 @@ async fn handle_tool_call(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(20)
                 .min(100) as usize;
-
-            match router
-                .blackboard()
-                .read_inbox(&peer, unread_only, limit, mark_read)
-            {
+            let all_projects = args
+                .get("all_projects")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let ack_ids: Vec<i64> = args
+                .get("ack")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let project = router.project().to_string();
+            let board = router.blackboard();
+            let acked = if ack_ids.is_empty() {
+                0
+            } else {
+                board.ack_messages(&peer, &ack_ids).unwrap_or(0)
+            };
+            match board.read_inbox_project(
+                &peer,
+                &project,
+                all_projects,
+                unread_only,
+                limit,
+                mark_read,
+            ) {
                 Ok(page) => mcp_text_result(
                     id,
                     json!({
                         "peer": peer,
+                        "project": project,
+                        "all_projects": all_projects,
+                        "acked": acked,
                         "unread": page.unread,
                         "marked_read": page.marked_read,
                         "messages": page.messages,
@@ -927,6 +1744,177 @@ async fn handle_tool_call(
                     false,
                 ),
                 Err(e) => mcp_text_result(id, format!("mesh_inbox failed: {e}"), true),
+            }
+        }
+        "mesh_tasks" => {
+            let peer = args.get("peer").and_then(|v| v.as_str());
+            let status = args.get("status").and_then(|v| v.as_str());
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            match router.blackboard().list_tasks(peer, status, limit) {
+                Ok(rows) => mcp_text_result(
+                    id,
+                    serde_json::to_string_pretty(&rows).unwrap_or_default(),
+                    false,
+                ),
+                Err(e) => mcp_text_result(id, format!("mesh_tasks failed: {e}"), true),
+            }
+        }
+        "mesh_ack" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let note = args.get("note").and_then(|v| v.as_str());
+            if task_id.is_empty() {
+                return mcp_text_result(id, "mesh_ack failed: task_id required".into(), true);
+            }
+            match router.blackboard().ack_task(task_id, note) {
+                Ok(true) => {
+                    let task = router.blackboard().get_task(task_id).ok().flatten();
+                    mcp_text_result(
+                        id,
+                        serde_json::to_string_pretty(&json!({"acked": true, "task": task}))
+                            .unwrap_or_default(),
+                        false,
+                    )
+                }
+                Ok(false) => mcp_text_result(
+                    id,
+                    format!(
+                        "mesh_ack: task '{task_id}' is not in a delivered/queued/claimed state"
+                    ),
+                    true,
+                ),
+                Err(e) => mcp_text_result(id, format!("mesh_ack failed: {e}"), true),
+            }
+        }
+        "mesh_next" => {
+            let peer = default_identity(
+                args.get("peer")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+            );
+            let project = args
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| router.project().to_string());
+            let lease_secs = args
+                .get("lease_secs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(300);
+            match router
+                .blackboard()
+                .claim_next_task(&peer, &project, lease_secs)
+            {
+                Ok(task) => mcp_text_result(
+                    id,
+                    serde_json::to_string_pretty(
+                        &json!({"claimed": task, "peer": peer, "project": project}),
+                    )
+                    .unwrap_or_default(),
+                    false,
+                ),
+                Err(e) => mcp_text_result(id, format!("mesh_next failed: {e}"), true),
+            }
+        }
+        "mesh_task_done" | "mesh_task_fail" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let status = if tool_name == "mesh_task_done" {
+                "done"
+            } else {
+                "failed"
+            };
+            let reason = args.get("reason").and_then(|v| v.as_str());
+            match router.blackboard().set_task_status(task_id, status, reason) {
+                Ok(true) => mcp_text_result(
+                    id,
+                    json!({"updated": true, "task_id": task_id, "status": status}).to_string(),
+                    false,
+                ),
+                Ok(false) => mcp_text_result(id, format!("task '{task_id}' not found"), true),
+                Err(e) => mcp_text_result(id, format!("{tool_name} failed: {e}"), true),
+            }
+        }
+        "mesh_connectors" => {
+            let registry = octo_core::ConnectorsConfig::load_global().unwrap_or_default();
+            let rows = connector::status_rows(
+                &registry,
+                router.config(),
+                router.project(),
+                router.blackboard(),
+            );
+            mcp_text_result(
+                id,
+                serde_json::to_string_pretty(
+                    &json!({"project": router.project(), "connectors": rows}),
+                )
+                .unwrap_or_default(),
+                false,
+            )
+        }
+        "mesh_connector_call" => {
+            let name = args
+                .get("connector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let request = args.get("request").cloned().unwrap_or_else(|| json!({}));
+            let timeout_secs = args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30);
+            let project = router.project().to_string();
+            let registry = match octo_core::ConnectorsConfig::load_global() {
+                Ok(r) => r,
+                Err(e) => {
+                    return mcp_text_result(id, format!("mesh_connector_call failed: {e}"), true)
+                }
+            };
+            let profile = match connector::check_connector_permission(
+                &registry,
+                router.config(),
+                &project,
+                &name,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = router.blackboard().record_connector_call(
+                        &name,
+                        &project,
+                        "tools/call",
+                        false,
+                        Some(&e.message()),
+                    );
+                    return mcp_text_result(id, format!("{}: {}", e.code(), e.message()), true);
+                }
+            };
+            match connector::call_connector(profile, &request.to_string(), timeout_secs) {
+                Ok(resp) => {
+                    let ok = serde_json::from_str::<Value>(&resp)
+                        .map(|v| v.get("error").is_none())
+                        .unwrap_or(true);
+                    let _ = router.blackboard().record_connector_call(
+                        &name,
+                        &project,
+                        "tools/call",
+                        ok,
+                        None,
+                    );
+                    mcp_text_result(id, resp, false)
+                }
+                Err(e) => {
+                    let _ = router.blackboard().record_connector_call(
+                        &name,
+                        &project,
+                        "tools/call",
+                        false,
+                        Some(&e),
+                    );
+                    mcp_text_result(id, format!("connector_error: {e}"), true)
+                }
             }
         }
         _ => json!({

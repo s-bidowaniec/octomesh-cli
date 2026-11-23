@@ -25,6 +25,9 @@ fn test_config() -> MeshConfig {
             timeout_secs: 5,
             cooldown_secs: Some(120),
             env: HashMap::new(),
+            max_prompt_chars: None,
+            window_bus: None,
+            window_path: None,
         },
     );
     peers.insert(
@@ -36,6 +39,9 @@ fn test_config() -> MeshConfig {
             timeout_secs: 5,
             cooldown_secs: Some(120),
             env: HashMap::new(),
+            max_prompt_chars: None,
+            window_bus: None,
+            window_path: None,
         },
     );
 
@@ -62,6 +68,7 @@ fn test_config() -> MeshConfig {
         ],
         roles,
         peers,
+        ..MeshConfig::default()
     }
 }
 

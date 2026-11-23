@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pcloud": {
+      "command": "pcloud-mcp",
+      "args": [],
+      "env": { "PCLOUD_ACCESS_TOKEN": "${PCLOUD_ACCESS_TOKEN}" }
+    }
+  }
+}

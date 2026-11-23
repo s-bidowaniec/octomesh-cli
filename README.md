@@ -251,6 +251,75 @@ cooldown_secs = 60
 
 ---
 
+## Install from any directory + diagnostics (AF-01)
+
+```bash
+cargo install --path crates/octo-cli   # or: octo install --prefix ~/.local
+# prints: export PATH="~/.local/bin:$PATH"; export OCTOMESH_CONFIG=...; export OCTOMESH_DB=...
+octo doctor                            # OK/WARN/FAIL per check; exit 0 only when all OK
+```
+
+`octo install` copies the binary to `<prefix>/bin/octo`, the adapter layer to
+`<prefix>/share/octomesh/adapters/`, and writes a global
+`~/.config/octomesh/octomesh.toml` with an **absolute** `adapter_runner`, so
+`octo` works from any project directory. Config resolution order:
+`./octomesh.toml` -> `$OCTOMESH_CONFIG` -> `~/.config/octomesh/octomesh.toml`.
+State DB: `./.octomesh/state.db` -> `$OCTOMESH_DB` -> `~/.octomesh/state.db`.
+
+## Projects, presence, tasks and coordination (AF-02..AF-05)
+
+- Every mailbox message is stamped with a **project** (`[project].name` /
+  `[mesh].project`, else the slug of the git `origin` remote, else `default`).
+  `octo inbox` shows only the current project (`--all-projects` to opt out),
+  `octo inbox --ack <id>...` acknowledges your own rows (`ack_at`), and
+  `octo projects` lists per-project unread counts. MCP: `mesh_send`/`mesh_inbox`
+  are project-scoped too (`mesh_inbox` accepts `ack` and `all_projects`).
+- Every `octo` invocation registers the caller in the **presence** table
+  (`octo presence`, LIVE/STALE with `presence_ttl_secs`).
+- Every `octo ask` / `mesh_ask` creates a tracked **task** row
+  (`queued -> delivered -> accepted -> done | failed`, visible via
+  `octo tasks` / `mesh_tasks`). Window (D-Bus) deliveries are typed with
+  `task=<id>` in the header; the receiver confirms with `octo ack <id>` /
+  `mesh_ack`. `octo next --peer X` claims queued tasks atomically with a lease
+  (`claimed_at` + `lease_secs`; stale claims requeue automatically),
+  `octo done <id>` / `octo fail <id> --reason ...` close them.
+- Peers marked `busy` recover automatically after `busy_ttl_secs` (crash-safe).
+- Prompts are checked against a context budget **before** any adapter runs:
+  `[budgets] default_max_prompt_chars = 20000` and per-peer
+  `[peers.x] max_prompt_chars`. Over the limit -> `budget_exceeded`, the task is
+  marked `failed`, no adapter is spawned and no cooldown is set. Usage is
+  logged (`budget_usage`, est_tokens = chars/4 heuristic); see
+  `octo budget --peer X`.
+
+## Connector gateway & sharing (AF-06/AF-07)
+
+A global registry `~/.config/octomesh/connectors.toml` (see
+`connectors.toml.example`: **drive** and **github** first, then gitlab, pcloud
+and filen marked experimental, figma optional) plus a per-project allowlist
+(`[project] allowed_connectors = ["github", "drive"]`).
+
+```bash
+octo connectors                 # registry entries: allowed, binary present, env key NAMES only
+octo connectors --audit         # last 20 audited calls (never secret values)
+octo connector call github '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+octo share report.pdf --via drive --to agy --message "see this"   # posts a mailbox link
+octo share report.pdf --via drive --to agy --dry-run               # prints payloads, touches nothing
+```
+
+MCP: `mesh_connectors`, `mesh_connector_call {connector, request}`.
+Denied connectors answer `connector_not_allowed` (exit 2); every call is
+audited in `connector_calls`. Client-side snippets live in `examples/connectors/*.mcp.json`.
+
+## End-to-end test (AF-08)
+
+```bash
+cargo build --workspace
+bash scripts/e2e_mesh.sh --mock-only   # CI job `e2e-mock`; PASS lines per AF scenario
+bash scripts/e2e_mesh.sh --real        # manual, needs tmux + real CLIs; see docs/ACCEPTANCE.md
+```
+
+---
+
 ## Adding a New CLI Adapter
 
 Because `octo-core` communicates with adapters strictly over JSON on `stdin`/`stdout`, adding a new terminal agent requires zero Rust changes:

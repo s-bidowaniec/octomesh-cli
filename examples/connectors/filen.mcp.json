@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "filen": {
+      "command": "filen-mcp",
+      "args": [],
+      "env": { "FILEN_API_KEY": "${FILEN_API_KEY}" }
+    }
+  }
+}

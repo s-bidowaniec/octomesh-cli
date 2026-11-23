@@ -92,9 +92,10 @@ def test_claude_adapter_maps_weekly_limit_to_rate_limited():
             "readonly": True,
         }
     )
-    with patch("shutil.which", return_value="/usr/bin/claude"), patch(
-        "subprocess.run", return_value=fake_proc
-    ) as mock_run:
+    with (
+        patch("shutil.which", return_value="/usr/bin/claude"),
+        patch("subprocess.run", return_value=fake_proc) as mock_run,
+    ):
         resp = dispatch(payload)
 
     assert resp.status == ErrorCode.RATE_LIMITED
@@ -116,9 +117,10 @@ def test_agy_adapter_builds_readonly_and_auto_commands():
             "timeout_secs": 45,
         }
     )
-    with patch("shutil.which", return_value="/usr/bin/agy"), patch(
-        "subprocess.run", return_value=fake_proc
-    ) as mock_run:
+    with (
+        patch("shutil.which", return_value="/usr/bin/agy"),
+        patch("subprocess.run", return_value=fake_proc) as mock_run,
+    ):
         resp = dispatch(payload)
 
     assert resp.status == ErrorCode.OK
@@ -143,9 +145,10 @@ def test_vibe_adapter_builds_readonly_command():
             "readonly": True,
         }
     )
-    with patch("shutil.which", return_value="/usr/bin/vibe"), patch(
-        "subprocess.run", return_value=fake_proc
-    ) as mock_run:
+    with (
+        patch("shutil.which", return_value="/usr/bin/vibe"),
+        patch("subprocess.run", return_value=fake_proc) as mock_run,
+    ):
         resp = dispatch(payload)
 
     assert resp.status == ErrorCode.OK
@@ -174,9 +177,10 @@ def test_codex_adapter_uses_ephemeral_and_readonly_sandbox():
             "readonly": True,
         }
     )
-    with patch("shutil.which", return_value="/usr/bin/codex"), patch(
-        "subprocess.run", side_effect=fake_run
-    ) as mock_run:
+    with (
+        patch("shutil.which", return_value="/usr/bin/codex"),
+        patch("subprocess.run", side_effect=fake_run) as mock_run,
+    ):
         resp = dispatch(payload)
 
     assert resp.status == ErrorCode.OK
@@ -252,9 +256,10 @@ def test_dbus_adapter_types_into_window_and_reads_reply_file(tmp_path):
         return CompletedProcess(args=cmd, returncode=0, stdout="(true,)\n", stderr="")
 
     payload = _dbus_payload(tmp_path, extra_args=["reply_file=inbox/reply.md"])
-    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch(
-        "subprocess.run", side_effect=fake_run
-    ) as mock_run:
+    with (
+        patch("shutil.which", return_value="/usr/bin/gdbus"),
+        patch("subprocess.run", side_effect=fake_run) as mock_run,
+    ):
         resp = dispatch(payload)
         assert dispatch(payload).status == ErrorCode.OK
 
@@ -284,8 +289,9 @@ def test_dbus_adapter_busctl_form_sends_raw_text(tmp_path):
 
     payload = json.loads(_dbus_payload(tmp_path, command="busctl"))
     payload["prompt"] = "Review the auth middleware\r\n\x1b[201~\x03Keep it staged"
-    with patch("shutil.which", return_value="/usr/bin/busctl"), patch(
-        "subprocess.run", side_effect=fake_run
+    with (
+        patch("shutil.which", return_value="/usr/bin/busctl"),
+        patch("subprocess.run", side_effect=fake_run),
     ):
         resp = dispatch(json.dumps(payload))
 
@@ -334,8 +340,9 @@ def test_dbus_adapter_maps_service_unknown_to_cli_not_found(tmp_path):
         "The name org.kde.konsole was not provided by any .service files",
     )
     payload = _dbus_payload(tmp_path)
-    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch(
-        "subprocess.run", return_value=fake_proc
+    with (
+        patch("shutil.which", return_value="/usr/bin/gdbus"),
+        patch("subprocess.run", return_value=fake_proc),
     ):
         resp = dispatch(payload)
     assert resp.status == ErrorCode.CLI_NOT_FOUND
@@ -354,9 +361,39 @@ def test_dbus_adapter_reply_timeout(tmp_path):
     payload["timeout_secs"] = 1
     payload = json.dumps(payload)
     fake_proc = CompletedProcess(args=["gdbus"], returncode=0, stdout="(true,)", stderr="")
-    with patch("shutil.which", return_value="/usr/bin/gdbus"), patch(
-        "subprocess.run", return_value=fake_proc
+    with (
+        patch("shutil.which", return_value="/usr/bin/gdbus"),
+        patch("subprocess.run", return_value=fake_proc),
     ):
         resp = dispatch(payload)
     assert resp.status == ErrorCode.TIMEOUT
     assert "<<OCTO_DONE>>" in resp.error_message
+
+
+def test_delegation_header_includes_task_id_when_env_set():
+    from octomesh_adapters.context import build_delegation_header
+
+    header = build_delegation_header("vibe", 1, False, task_id="task-123")
+    expected = "[Octomesh Delegation | task=task-123 | caller=vibe | depth=1 | readonly=False]"
+    assert header == expected
+    assert "task=" not in build_delegation_header("vibe", 1, False, task_id=None)
+
+
+def test_dbus_adapter_types_task_id_into_window_header(tmp_path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return CompletedProcess(args=cmd, returncode=0, stdout="(true,)\n", stderr="")
+
+    payload = json.loads(_dbus_payload(tmp_path))
+    payload["env"] = {"OCTOMESH_TASK_ID": "task-abc-42"}
+    with (
+        patch("shutil.which", return_value="/usr/bin/gdbus"),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        resp = dispatch(json.dumps(payload))
+    assert resp.status == ErrorCode.OK
+    typed = captured["cmd"][-1]
+    assert "task=task-abc-42" in typed
+    assert "caller=vibe" in typed
