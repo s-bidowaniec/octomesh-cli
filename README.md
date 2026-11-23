@@ -138,6 +138,13 @@ Add `octo mcp-serve` to your agent's MCP configuration (see `examples/mcp.json`)
 
 ---
 
+## Shared project files
+
+Run `octo workspace init` in the project. Agents can find its shared files
+through the `mesh_workspace` MCP tool. Use `octo workspace publish RELATIVE_FILE`
+to copy a finished artifact to the export folder for Filen Desktop.
+[Shared workspace and cloud setup](docs/shared-workspace.md)
+
 ## `octomesh.toml` Example
 
 ```toml
