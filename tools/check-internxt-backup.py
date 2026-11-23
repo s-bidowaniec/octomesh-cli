@@ -1,6 +1,8 @@
 """Loopback acceptance test for the OctoMesh rclone backup command."""
 
 import argparse
+import hashlib
+import json
 import os
 import socket
 import subprocess
@@ -175,6 +177,52 @@ def test_exchange(octo, root):
             invoke(args("pc"), root / "pc")
             invoke(args("vps"), root / "vps")
             assert sorted(invoke(cloud_args).stdout.splitlines()) == cloud_files
+
+            local_retry = pc / "files" / "retry.txt"
+            payload = b"expected"
+            local_retry.write_bytes(payload)
+            sha256 = hashlib.sha256(payload).hexdigest()
+            record = json.dumps(
+                [["retry.txt"], sha256, len(payload)], separators=(",", ":")
+            )
+            revision_id = hashlib.sha256(record.encode()).hexdigest()
+            remote_revision = (
+                "secure:OctoMesh/Projekty/p_123/Maszyny/pc/Agenty/codex/"
+                f"Sesje/r01/Wersje/{revision_id}"
+            )
+            fake = root / "wrong-payload"
+            fake.write_bytes(b"corrupt!")
+            assert fake.stat().st_size == len(payload)
+            invoke(["rclone", "copyto", str(fake), f"{remote_revision}/payload"])
+
+            # A directory with only a payload is interrupted, rather than published.
+            invoke(args("vps"), root / "vps")
+            assert not list(vps_inbox.rglob("retry.txt"))
+
+            # A same-size object with wrong bytes cannot satisfy an upload retry.
+            (pc / "files" / "independent.txt").write_bytes(b"still uploaded")
+            retry = invoke(args("pc"), root / "pc", check=False)
+            assert retry.returncode != 0 and "SHA-256" in retry.stderr
+            assert invoke(["rclone", "lsf", remote_revision]).stdout.splitlines() == [
+                "payload"
+            ]
+            assert (
+                invoke(["rclone", "cat", f"{remote_revision}/payload"]).stdout
+                == "corrupt!"
+            )
+            invoke(args("vps"), root / "vps")
+            assert (
+                next(vps_inbox.rglob("independent.txt")).read_bytes()
+                == b"still uploaded"
+            )
+
+            # Model recovery from a bad remote object, a committed empty file and a resume.
+            invoke(["rclone", "deletefile", f"{remote_revision}/payload"])
+            (pc / "files" / "empty.txt").touch()
+            invoke(args("pc"), root / "pc")
+            invoke(args("vps"), root / "vps")
+            assert next(vps_inbox.rglob("retry.txt")).read_bytes() == payload
+            assert next(vps_inbox.rglob("empty.txt")).read_bytes() == b""
         finally:
             server.terminate()
             server.wait(timeout=10)

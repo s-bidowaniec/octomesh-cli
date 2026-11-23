@@ -108,6 +108,11 @@ przerwy w sieci potrzebne jest miejsce na nieprzesłane dane. Odbiornik
 pobiera wersje pozostałych maszyn w wybranym projekcie i zachowuje je
 lokalnie.
 
+Manifest jest publikowany po danych i oznacza gotową wersję.
+Przy ponowieniu wysyłki OctoMesh sprawdza SHA-256 istniejących danych
+przed wyczyszczeniem lokalnej kolejki. Odbiornik weryfikuje rozmiar
+i SHA-256 przed przeniesieniem pliku do `inbox`.
+
 Na Linuksie można uruchamiać proces jako usługę użytkownika. Przykładowy
 plik `~/.config/systemd/user/octomesh-backup-p_123.service`:
 

@@ -9,6 +9,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -18,6 +19,17 @@ use std::time::{Duration, UNIX_EPOCH};
 use tempfile::{Builder, NamedTempFile};
 
 const MANIFEST_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct RevisionConflict(&'static str);
+
+impl fmt::Display for RevisionConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
 
 #[derive(Debug, clap::Args)]
 pub struct BackupArgs {
@@ -124,8 +136,9 @@ impl Remote {
     }
 }
 
-fn rclone(args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("rclone")
+fn rclone_command(args: &[&str]) -> Command {
+    let mut command = Command::new("rclone");
+    command
         .args(args)
         .args([
             "--ask-password=false",
@@ -140,7 +153,12 @@ fn rclone(args: &[&str]) -> Result<Vec<u8>> {
             "--low-level-retries=1",
         ])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn rclone(args: &[&str]) -> Result<Vec<u8>> {
+    let output = rclone_command(args)
         .output()
         .context("Could not start rclone")?;
     if !output.status.success() {
@@ -151,6 +169,76 @@ fn rclone(args: &[&str]) -> Result<Vec<u8>> {
 
 fn copy_one(source: &str, destination: &str) -> Result<()> {
     rclone(&["copyto", source, destination, "--immutable", "--size-only"])?;
+    Ok(())
+}
+
+fn remote_file_exists(path: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct RemoteStat {
+        is_dir: bool,
+    }
+    let output = rclone_command(&["lsjson", "--stat", path])
+        .output()
+        .context("Could not stat remote backup object")?;
+    match output.status.code() {
+        Some(3 | 4) => Ok(false), // rclone directory or file not found
+        Some(0) if !output.stdout.is_empty() => {
+            if serde_json::from_slice::<RemoteStat>(&output.stdout)?.is_dir {
+                return Err(RevisionConflict("Remote backup object is a directory").into());
+            }
+            Ok(true)
+        }
+        _ => bail!("Could not stat remote backup object ({})", output.status),
+    }
+}
+
+fn read_remote_manifest(path: &str) -> Result<Revision> {
+    let limit = (MANIFEST_LIMIT + 1).to_string();
+    let bytes = rclone(&["cat", path, "--count", &limit])?;
+    if bytes.len() > MANIFEST_LIMIT {
+        return Err(RevisionConflict("Remote manifest exceeds its size limit").into());
+    }
+    let manifest: Revision = serde_json::from_slice(&bytes)
+        .map_err(|_| RevisionConflict("Remote manifest could not be parsed"))?;
+    manifest
+        .check()
+        .map_err(|_| RevisionConflict("Remote manifest failed validation"))?;
+    Ok(manifest)
+}
+
+/// Read at most one byte beyond the claimed length to detect oversized objects
+/// without accepting an unbounded write to local storage.
+fn read_verified_payload(path: &str, revision: &Revision, output: &mut impl Write) -> Result<()> {
+    let limit = revision
+        .length
+        .checked_add(1)
+        .context("Invalid revision length")?;
+    let count = limit.to_string();
+    let mut child = rclone_command(&["cat", path, "--count", &count])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Could not open remote payload")?;
+    let mut stream = child
+        .stdout
+        .take()
+        .expect("rclone stdout was piped")
+        .take(limit);
+    let result = hash_and_copy(&mut stream, output);
+    drop(stream);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let (hash, length) = result?;
+    if length > revision.length
+        || (status.success() && (revision.length != length || revision.sha256 != hash))
+    {
+        return Err(RevisionConflict("Remote payload does not match its SHA-256 manifest").into());
+    }
+    if !status.success() {
+        bail!("Could not read remote payload ({status})");
+    }
     Ok(())
 }
 
@@ -436,6 +524,7 @@ impl Store {
 
     fn send_pending(&self, remote: &Remote, origin: &Origin) -> Result<usize> {
         let mut sent = 0;
+        let mut conflict = None;
         for entry in fs::read_dir(&self.pending)? {
             let entry = entry?;
             let id = entry.file_name().to_string_lossy().into_owned();
@@ -452,18 +541,24 @@ impl Store {
             if record.id()? != id {
                 bail!("Pending revision and manifest differ");
             }
-            let folder = remote.path(&format!(
-                "{}/{}",
-                origin.cloud_path(record.repository()?),
-                id
-            ));
-            let payload = entry.path().join("payload");
-            let manifest = entry.path().join("manifest.json");
-            copy_one(as_str(&payload)?, &format!("{folder}/payload"))?;
-            copy_one(as_str(&manifest)?, &format!("{folder}/manifest.json"))?;
+            if let Err(err) = send_revision(remote, origin, &entry.path(), &id, &record) {
+                if err.is::<RevisionConflict>() {
+                    conflict.get_or_insert_with(|| {
+                        err.context(format!("Outgoing revision {id} is pending"))
+                    });
+                    continue;
+                }
+                return Err(err);
+            }
             write_json(&self.sent.join(&id), &record)?;
             fs::remove_dir_all(entry.path())?;
             sent += 1;
+        }
+        if let Some(conflict) = conflict {
+            if sent != 0 {
+                tracing::info!(sent, "Uploaded independent revisions");
+            }
+            return Err(conflict);
         }
         Ok(sent)
     }
@@ -472,16 +567,20 @@ impl Store {
         let listing = rclone(&[
             "lsf",
             &remote.project,
-            "--dirs-only",
+            "--files-only",
             "--recursive",
             "--max-depth",
-            "10",
+            "11",
+            "--include",
+            "**/manifest.json",
         ])?;
         let listing = std::str::from_utf8(&listing)?;
         let mut received = 0;
         let mut errors = 0;
         for line in listing.lines() {
-            let relative = line.trim_end_matches('/');
+            let Some(relative) = line.strip_suffix("/manifest.json") else {
+                continue;
+            };
             let Some((origin, id, repo)) = read_route(relative) else {
                 continue;
             };
@@ -520,17 +619,7 @@ impl Store {
             return Ok(false);
         }
         let folder = remote.path(relative);
-        let meta = rclone(&[
-            "cat",
-            &format!("{folder}/manifest.json"),
-            "--count",
-            "65537",
-        ])?;
-        if meta.len() > MANIFEST_LIMIT {
-            bail!("Incoming manifest exceeds its size limit");
-        }
-        let revision: Revision = serde_json::from_slice(&meta)?;
-        revision.check()?;
+        let revision = read_remote_manifest(&format!("{folder}/manifest.json"))?;
         if revision.repository()? != repo || revision.id()? != id {
             bail!("Incoming revision and manifest differ");
         }
@@ -549,12 +638,11 @@ impl Store {
             dir = private_dir(&dir, parent)?;
         }
         let payload = dir.join(file);
-        copy_one(&format!("{folder}/payload"), as_str(&payload)?)?;
-        let mut contents = OpenOptions::new().read(true).write(true).open(&payload)?;
-        let (hash, length) = hash_and_copy(&mut contents, &mut std::io::sink())?;
-        if length != revision.length || hash != revision.sha256 {
-            bail!("Incoming file does not match its SHA-256 manifest");
-        }
+        let mut contents = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&payload)?;
+        read_verified_payload(&format!("{folder}/payload"), &revision, &mut contents)?;
         contents.sync_all()?;
         drop(contents);
         sync_directory(&dir)?;
@@ -568,6 +656,35 @@ impl Store {
             Err(err) => Err(err).context("Publish verified incoming revision"),
         }
     }
+}
+
+fn send_revision(
+    remote: &Remote,
+    origin: &Origin,
+    directory: &Path,
+    id: &str,
+    record: &Revision,
+) -> Result<()> {
+    let folder = remote.path(&format!("{}/{id}", origin.cloud_path(record.repository()?)));
+    let remote_payload = format!("{folder}/payload");
+    let remote_manifest = format!("{folder}/manifest.json");
+    if remote_file_exists(&remote_payload)? {
+        // An existing object of the same size may have different bytes.
+        read_verified_payload(&remote_payload, record, &mut std::io::sink())?;
+    } else {
+        copy_one(as_str(&directory.join("payload"))?, &remote_payload)?;
+    }
+    if remote_file_exists(&remote_manifest)? {
+        if read_remote_manifest(&remote_manifest)?.id()? != id {
+            return Err(RevisionConflict(
+                "Existing remote manifest differs from the pending revision",
+            )
+            .into());
+        }
+    } else {
+        copy_one(as_str(&directory.join("manifest.json"))?, &remote_manifest)?;
+    }
+    Ok(())
 }
 
 fn read_route(relative: &str) -> Option<(Origin, &str, Option<&str>)> {
